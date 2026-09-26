@@ -1,5 +1,8 @@
 /.venv
 /dataset
 /dataset_back
+/dataset_processed/*
+!/dataset_processed/.gitkeep
 /images
 /models
+src/__pycache__

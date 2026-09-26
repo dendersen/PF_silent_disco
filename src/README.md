@@ -28,9 +28,11 @@ python3 src/silent_disco.py images/_MG_7098.JPG --device xpu
 The runtime stages are in `silent_disco.py`:
 
 1. `preprocess_image` upscales undersized frames until their shortest dimension is 3500 pixels, never downscales, and keeps colorful or bright pixels.
-2. `find_candidate_points` returns intentionally generous blob proposals.
-3. A two-class `SmallConvNet` decides whether each 255x255 crop contains a headset.
-4. A four-class `SmallConvNet` predicts green, blue, red, or unknown.
+2. Ultralytics YOLO detects people and returns bounding boxes, avoiding color/blob proposals that can miss people or select lights and walls.
+3. Each person box is converted into a padded square crop around the head and resized to 255x255 for the next stages.
+4. The four-class `SmallConvNet` predicts green, blue, red, or unknown. Detector boxes are retained even when color is unknown so crops are not silently discarded.
+
+The default detector is `models/yolo11n.pt`; Ultralytics downloads it on first use. The default person confidence is `0.08`, which is useful for overhead event photos. Adjust it with `--person-confidence`. The older presence checkpoint is not used as a gate by default because it was trained on point-centered crops; enable `--verify-presence` only after retraining it with detector-generated head crops.
 
 Train checkpoints with labeled crops:
 
@@ -43,6 +45,28 @@ dataset/
   color/red/*.jpg
   color/unknown/*.jpg
 ```
+
+Training automatically generates augmented crops in memory from `generate.settings`. Each variant can add bounded pixel noise, move the crop center in both axes, and simulate smoke by reducing saturation and increasing brightness:
+
+```ini
+[generate]
+enabled = true
+iterations = 4
+noise_strength = 0.15
+max_shift = 10
+smoke_strength = 0.15
+seed = 20260926
+delete_dataset_after_training = true
+```
+
+Train both models with one command, or select one with `--kind`:
+
+```bash
+python3 src/train_models.py dataset
+python3 src/train_models.py dataset --kind color --output models/color.pt
+```
+
+Each epoch displays a batch progress bar. Augmentation is normally in memory, so the source `dataset` is never deleted. If training is pointed at the legacy generated directory named `dataset_processed`, it is removed after all requested models save when `delete_dataset_after_training` is enabled.
 
 Create those crops with the browser annotator. Click a headset or other point
 in the image, then choose a button. `No headset` creates a negative presence
@@ -66,11 +90,6 @@ python3 src/annotate_training.py images --dataset dataset --open
 The next-image action alternates between a randomly selected still image and a
 random frame from a randomly selected video. If port `8765` is already in use,
 choose another port, for example `--port 8766`.
-
-```bash
-python3 src/train_models.py dataset --kind presence --output models/presence.pt
-python3 src/train_models.py dataset --kind color --output models/color.pt
-```
 
 Training stops at the first of four conditions: press Enter, reach
 `--target-loss`, reach `--max-time` seconds, or reach `--epochs`. Use

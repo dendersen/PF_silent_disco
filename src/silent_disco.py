@@ -30,6 +30,7 @@ class Candidate:
 class Detection:
     x: int
     y: int
+    box: tuple[int, int, int, int]
     presence: float
     color: str
     color_confidence: float
@@ -136,6 +137,17 @@ def crop_255(image_bgr: np.ndarray, x: int, y: int, size: int = 255) -> np.ndarr
     return padded[y:y + size, x:x + size]
 
 
+def crop_person_head(image_bgr: np.ndarray, box: tuple[int, int, int, int], size: int = 255) -> tuple[np.ndarray, tuple[int, int]]:
+    """Make a square, resized crop around the head end of a detected person box."""
+    x1, y1, x2, y2 = box
+    box_width, box_height = max(1, x2 - x1), max(1, y2 - y1)
+    crop_size = max(32, round(max(box_width * 0.9, box_height * 0.28)))
+    center_x = round((x1 + x2) / 2)
+    center_y = round(y1 + box_height * 0.18)
+    crop = crop_255(image_bgr, center_x, center_y, crop_size)
+    return cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA), (center_x, center_y)
+
+
 class SmallConvNet(nn.Module):
     def __init__(self, classes: int) -> None:
         super().__init__()
@@ -157,6 +169,30 @@ def load_model(path: Path | None, classes: int, device: torch.device) -> SmallCo
     model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
     model.eval()
     return model
+
+
+def load_person_detector(path: Path, device: torch.device):
+    """Load a pretrained detector and configure it to return people only."""
+    try:
+        from ultralytics import YOLO
+    except ImportError as error:
+        raise RuntimeError("Person detection requires ultralytics; install src/requirements.txt") from error
+    detector = YOLO(str(path))
+    detector.to(str(device))
+    return detector
+
+
+def detect_people(detector, image_bgr: np.ndarray, confidence: float = 0.25) -> list[tuple[tuple[int, int, int, int], float]]:
+    """Return person boxes from YOLO, clipped to the source image."""
+    result = detector.predict(image_bgr, classes=[0], conf=confidence, verbose=False)[0]
+    height, width = image_bgr.shape[:2]
+    detections = []
+    for coordinates, score in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy()):
+        x1, y1, x2, y2 = (round(float(value)) for value in coordinates)
+        box = (max(0, x1), max(0, y1), min(width - 1, x2), min(height - 1, y2))
+        if box[2] > box[0] and box[3] > box[1]:
+            detections.append((box, float(score)))
+    return detections
 
 
 def tensor_from_bgr(crop: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -190,37 +226,40 @@ def heuristic_color(crop: np.ndarray) -> tuple[str, float]:
     return (color, min(1.0, scores[color] * 8.0)) if scores[color] >= 0.01 else ("unknown", 0.0)
 
 
-def analyze_frame(image_bgr: np.ndarray, presence_model: SmallConvNet | None, color_model: SmallConvNet | None, device: torch.device, presence_threshold: float = 0.65) -> tuple[list[Detection], dict[str, float], np.ndarray]:
-    cleaned, mask = preprocess_image(image_bgr)
-    scale_x, scale_y = image_bgr.shape[1] / cleaned.shape[1], image_bgr.shape[0] / cleaned.shape[0]
-    candidates = find_candidate_points(cleaned, mask)
+def analyze_frame(image_bgr: np.ndarray, detector, presence_model: SmallConvNet | None, color_model: SmallConvNet | None, device: torch.device, presence_threshold: float = 0.35, person_confidence: float = 0.08, verify_presence: bool = False) -> tuple[list[Detection], dict[str, float], np.ndarray]:
+    people = detect_people(detector, image_bgr, person_confidence)
     crops = []
     points = []
-    for candidate in candidates:
-        x, y = round(candidate.x * scale_x), round(candidate.y * scale_y)
-        points.append((x, y))
-        crops.append(crop_255(image_bgr, x, y))
-    if presence_model is None:
-        presence_scores = [candidate.score for candidate in candidates]
+    boxes = []
+    detector_scores = []
+    for box, detector_score in people:
+        crop, point = crop_person_head(image_bgr, box)
+        boxes.append(box)
+        points.append(point)
+        crops.append(crop)
+        detector_scores.append(detector_score)
+    if presence_model is None or not verify_presence:
+        presence_scores = detector_scores
     else:
         presence_scores = predict_probabilities(presence_model, crops, device)[:, 1].tolist()
-    accepted = [(point, crop, presence) for point, crop, presence in zip(points, crops, presence_scores) if presence >= presence_threshold]
+    accepted = [(point, box, crop, presence) for point, box, crop, presence in zip(points, boxes, crops, presence_scores) if not verify_presence or presence >= presence_threshold]
     if color_model is None:
-        color_predictions = [heuristic_color(crop) for _, crop, _ in accepted]
+        color_predictions = [heuristic_color(crop) for _, _, crop, _ in accepted]
     elif accepted:
-        probabilities = predict_probabilities(color_model, [crop for _, crop, _ in accepted], device)
+        probabilities = predict_probabilities(color_model, [crop for _, _, crop, _ in accepted], device)
         color_predictions = [(COLOR_CLASSES[int(torch.argmax(probability).item())], float(torch.max(probability).item())) for probability in probabilities]
     else:
         color_predictions = []
     detections: list[Detection] = []
-    for (point, _, presence), (color, color_confidence) in zip(accepted, color_predictions):
+    for (point, box, _, presence), (color, color_confidence) in zip(accepted, color_predictions):
         x, y = point
-        if color in COLORS:
-            detections.append(Detection(x, y, presence, color, color_confidence))
+        detections.append(Detection(x, y, box, presence, color, color_confidence))
     counts = {color: sum(detection.color == color for detection in detections) for color in COLORS}
     ratios = {color: counts[color] / max(1, sum(counts.values())) for color in COLORS}
     annotated = image_bgr.copy()
     for detection in detections:
+        x1, y1, x2, y2 = detection.box
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 220, 0), 3)
         cv2.circle(annotated, (detection.x, detection.y), 18, (0, 220, 0), 3)
         cv2.putText(annotated, detection.color, (detection.x + 22, detection.y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return detections, ratios, annotated
@@ -252,17 +291,21 @@ def main() -> None:
     parser.add_argument("input", type=Path)
     parser.add_argument("--presence-model", type=Path)
     parser.add_argument("--color-model", type=Path)
+    parser.add_argument("--detector-model", type=Path, default=Path("models/yolo11n.pt"), help="YOLO person detector checkpoint; downloaded by Ultralytics when absent.")
+    parser.add_argument("--person-confidence", type=float, default=0.08)
+    parser.add_argument("--verify-presence", action="store_true", help="Also filter detector boxes with the legacy headset presence model.")
     parser.add_argument("--every", type=int, default=3, help="Analyze every Nth video frame.")
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "rocm", "xpu"), default="auto")
     args = parser.parse_args()
     device = resolve_device(args.device)
+    detector = load_person_detector(args.detector_model, device)
     presence_model = load_model(args.presence_model, 2, device)
     color_model = load_model(args.color_model, len(COLOR_CLASSES), device)
     smoother = RatioSmoother()
     for frame_number, frame in iter_frames(args.input, max(1, args.every)):
         started = time.perf_counter()
-        detections, ratios, annotated = analyze_frame(frame, presence_model, color_model, device)
+        detections, ratios, annotated = analyze_frame(frame, detector, presence_model, color_model, device, person_confidence=args.person_confidence, verify_presence=args.verify_presence)
         counts = {color: sum(d.color == color for d in detections) for color in COLORS}
         payload = {"frame": frame_number, "detections": len(detections), "ratios": ratios, "smoothed_ratios": smoother.update(counts), "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
         print(json.dumps(payload), flush=True)

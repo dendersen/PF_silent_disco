@@ -1,4 +1,4 @@
 # Install common dependencies first with: pip install -r src/requirements.txt
 # Replace rocm6.3 with the ROCm version installed on the target machine.
---extra-index-url https://download.pytorch.org/whl/rocm6.3
+--index-url https://download.pytorch.org/whl/rocm6.3
 torch>=2.4

@@ -1,0 +1,8 @@
+[generate]
+enabled = true
+iterations = 8
+noise_strength = 0.15
+max_shift = 10
+smoke_strength = 0.15
+seed = 20260926
+delete_dataset_after_training = true
