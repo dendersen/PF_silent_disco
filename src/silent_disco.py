@@ -1,0 +1,278 @@
+"""Semi-real-time silent disco headset audience estimator."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import cv2
+import numpy as np
+import torch
+from torch import nn
+
+
+COLORS = ("green", "blue", "red")
+COLOR_CLASSES = ("green", "blue", "red", "unknown")
+
+
+@dataclass(frozen=True)
+class Candidate:
+    x: int
+    y: int
+    score: float
+
+
+@dataclass(frozen=True)
+class Detection:
+    x: int
+    y: int
+    presence: float
+    color: str
+    color_confidence: float
+
+
+@dataclass
+class RatioSmoother:
+    alpha: float = 0.35
+    values: dict[str, float] | None = None
+
+    def update(self, counts: dict[str, int]) -> dict[str, float]:
+        total = sum(counts.values())
+        current = {color: (counts.get(color, 0) / total if total else 0.0) for color in COLORS}
+        if self.values is None:
+            self.values = current
+        else:
+            self.values = {color: self.alpha * current[color] + (1.0 - self.alpha) * self.values[color] for color in COLORS}
+        return dict(self.values)
+
+
+def rocm_available() -> bool:
+    """Return true only for a PyTorch build compiled with HIP/ROCm."""
+    return torch.version.hip is not None and torch.cuda.is_available()
+
+
+def resolve_device(requested: str = "auto") -> torch.device:
+    """Select CPU, NVIDIA CUDA, AMD ROCm, or Intel XPU at runtime."""
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "rocm":
+        if rocm_available():
+            return torch.device("cuda")
+        raise RuntimeError("Requested device 'rocm' requires a ROCm-enabled PyTorch build and an available AMD GPU")
+    if requested in {"cuda", "auto"} and torch.cuda.is_available():
+        return torch.device("cuda")
+    if requested in {"xpu", "auto"} and hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+    if requested != "auto":
+        raise RuntimeError(f"Requested device '{requested}' is not available in this PyTorch installation")
+    return torch.device("cpu")
+
+
+def preprocess_image(image_bgr: np.ndarray, min_side: int = 3500) -> tuple[np.ndarray, np.ndarray]:
+    """Suppress low-information pixels without downscaling the input."""
+    if image_bgr is None or image_bgr.ndim != 3:
+        raise ValueError("image_bgr must be a color image")
+    height, width = image_bgr.shape[:2]
+    scale = max(1.0, min_side / min(height, width))
+    image = cv2.resize(image_bgr, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_CUBIC) if scale > 1 else image_bgr.copy()
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    saturation, value = hsv[:, :, 1], hsv[:, :, 2]
+    colorful = ((saturation >= 70) & (value >= 45)).astype(np.uint8) * 255
+    bright_neutral = ((value >= 175) & (saturation >= 20)).astype(np.uint8) * 255
+    mask = cv2.bitwise_or(colorful, bright_neutral)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    enhanced = cv2.detailEnhance(image, sigma_s=10, sigma_r=0.15)
+    return cv2.bitwise_and(enhanced, enhanced, mask=mask), mask
+
+
+def find_candidate_points(cleaned_bgr: np.ndarray, mask: np.ndarray, max_candidates: int = 250, min_distance: int | None = None, augment_corners: bool = False) -> list[Candidate]:
+    """Return generous point proposals; the presence model removes light artifacts."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    height, width = mask.shape[:2]
+    proposals: list[Candidate] = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        x, y, box_width, box_height = cv2.boundingRect(contour)
+        if area < 8 or box_width < 3 or box_height < 3 or area > width * height * 0.08:
+            continue
+        moments = cv2.moments(contour)
+        if moments["m00"] == 0:
+            continue
+        center_x, center_y = int(moments["m10"] / moments["m00"]), int(moments["m01"] / moments["m00"])
+        roi = cleaned_bgr[y:y + box_height, x:x + box_width]
+        brightness = float(np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))) if roi.size else 0.0
+        score = min(1.0, 0.45 * min(1.0, area / 500.0) + 0.55 * brightness / 255.0)
+        proposals.append(Candidate(center_x, center_y, score))
+    proposals.sort(key=lambda item: item.score, reverse=True)
+    selected: list[Candidate] = []
+    min_distance = min_distance or max(5, round(min(height, width) * 0.006))
+    for proposal in proposals:
+        if all((proposal.x - item.x) ** 2 + (proposal.y - item.y) ** 2 >= min_distance**2 for item in selected):
+            selected.append(proposal)
+        if len(selected) >= max_candidates:
+            break
+    if not selected or augment_corners:
+        gray = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2GRAY)
+        corners = cv2.goodFeaturesToTrack(gray, maxCorners=max_candidates, qualityLevel=0.005, minDistance=min_distance, mask=mask)
+        if corners is not None:
+            for corner in corners.reshape(-1, 2):
+                point_x, point_y = round(float(corner[0])), round(float(corner[1]))
+                if all((point_x - item.x) ** 2 + (point_y - item.y) ** 2 >= min_distance**2 for item in selected):
+                    selected.append(Candidate(point_x, point_y, float(gray[point_y, point_x]) / 255.0))
+                if len(selected) >= max_candidates:
+                    break
+    return selected
+
+
+def crop_255(image_bgr: np.ndarray, x: int, y: int, size: int = 255) -> np.ndarray:
+    half = size // 2
+    padded = cv2.copyMakeBorder(image_bgr, half, half, half, half, cv2.BORDER_REFLECT_101)
+    return padded[y:y + size, x:x + size]
+
+
+class SmallConvNet(nn.Module):
+    def __init__(self, classes: int) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, 5, stride=2, padding=2), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1),
+        )
+        self.classifier = nn.Sequential(nn.Flatten(), nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, classes))
+
+    def forward(self, batch: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(batch))
+
+
+def load_model(path: Path | None, classes: int, device: torch.device) -> SmallConvNet | None:
+    if path is None or not path.exists():
+        return None
+    model = SmallConvNet(classes).to(device)
+    model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+    model.eval()
+    return model
+
+
+def tensor_from_bgr(crop: np.ndarray, device: torch.device) -> torch.Tensor:
+    return tensors_from_bgr([crop], device)
+
+
+def tensors_from_bgr(crops: list[np.ndarray], device: torch.device) -> torch.Tensor:
+    if not crops:
+        return torch.empty((0, 3, 255, 255), device=device)
+    arrays = [((cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 - 0.5) / 0.5).transpose(2, 0, 1) for crop in crops]
+    return torch.from_numpy(np.stack(arrays)).to(device)
+
+
+def predict_probabilities(model: SmallConvNet, crops: list[np.ndarray], device: torch.device, batch_size: int = 32) -> torch.Tensor:
+    outputs = []
+    with torch.inference_mode():
+        for start in range(0, len(crops), batch_size):
+            batch = tensors_from_bgr(crops[start:start + batch_size], device)
+            outputs.append(torch.softmax(model(batch), dim=1).cpu())
+    return torch.cat(outputs) if outputs else torch.empty((0, model.classifier[-1].out_features))
+
+
+def heuristic_color(crop: np.ndarray) -> tuple[str, float]:
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    scores = {
+        "green": float(np.mean((hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 85) & (hsv[:, :, 1] > 80))),
+        "blue": float(np.mean((hsv[:, :, 0] >= 90) & (hsv[:, :, 0] <= 135) & (hsv[:, :, 1] > 80))),
+        "red": float(np.mean(((hsv[:, :, 0] <= 10) | (hsv[:, :, 0] >= 170)) & (hsv[:, :, 1] > 80))),
+    }
+    color = max(scores, key=scores.get)
+    return (color, min(1.0, scores[color] * 8.0)) if scores[color] >= 0.01 else ("unknown", 0.0)
+
+
+def analyze_frame(image_bgr: np.ndarray, presence_model: SmallConvNet | None, color_model: SmallConvNet | None, device: torch.device, presence_threshold: float = 0.65) -> tuple[list[Detection], dict[str, float], np.ndarray]:
+    cleaned, mask = preprocess_image(image_bgr)
+    scale_x, scale_y = image_bgr.shape[1] / cleaned.shape[1], image_bgr.shape[0] / cleaned.shape[0]
+    candidates = find_candidate_points(cleaned, mask)
+    crops = []
+    points = []
+    for candidate in candidates:
+        x, y = round(candidate.x * scale_x), round(candidate.y * scale_y)
+        points.append((x, y))
+        crops.append(crop_255(image_bgr, x, y))
+    if presence_model is None:
+        presence_scores = [candidate.score for candidate in candidates]
+    else:
+        presence_scores = predict_probabilities(presence_model, crops, device)[:, 1].tolist()
+    accepted = [(point, crop, presence) for point, crop, presence in zip(points, crops, presence_scores) if presence >= presence_threshold]
+    if color_model is None:
+        color_predictions = [heuristic_color(crop) for _, crop, _ in accepted]
+    elif accepted:
+        probabilities = predict_probabilities(color_model, [crop for _, crop, _ in accepted], device)
+        color_predictions = [(COLOR_CLASSES[int(torch.argmax(probability).item())], float(torch.max(probability).item())) for probability in probabilities]
+    else:
+        color_predictions = []
+    detections: list[Detection] = []
+    for (point, _, presence), (color, color_confidence) in zip(accepted, color_predictions):
+        x, y = point
+        if color in COLORS:
+            detections.append(Detection(x, y, presence, color, color_confidence))
+    counts = {color: sum(detection.color == color for detection in detections) for color in COLORS}
+    ratios = {color: counts[color] / max(1, sum(counts.values())) for color in COLORS}
+    annotated = image_bgr.copy()
+    for detection in detections:
+        cv2.circle(annotated, (detection.x, detection.y), 18, (0, 220, 0), 3)
+        cv2.putText(annotated, detection.color, (detection.x + 22, detection.y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    return detections, ratios, annotated
+
+
+def iter_frames(path: Path, every: int) -> Iterable[tuple[int, np.ndarray]]:
+    if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
+        image = cv2.imread(str(path))
+        if image is None:
+            raise ValueError(f"Could not read {path}")
+        yield 0, image
+        return
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise ValueError(f"Could not open {path}")
+    frame_number = 0
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        if frame_number % every == 0:
+            yield frame_number, frame
+        frame_number += 1
+    capture.release()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Estimate silent disco DJ audience ratios from images or video.")
+    parser.add_argument("input", type=Path)
+    parser.add_argument("--presence-model", type=Path)
+    parser.add_argument("--color-model", type=Path)
+    parser.add_argument("--every", type=int, default=3, help="Analyze every Nth video frame.")
+    parser.add_argument("--display", action="store_true")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "rocm", "xpu"), default="auto")
+    args = parser.parse_args()
+    device = resolve_device(args.device)
+    presence_model = load_model(args.presence_model, 2, device)
+    color_model = load_model(args.color_model, len(COLOR_CLASSES), device)
+    smoother = RatioSmoother()
+    for frame_number, frame in iter_frames(args.input, max(1, args.every)):
+        started = time.perf_counter()
+        detections, ratios, annotated = analyze_frame(frame, presence_model, color_model, device)
+        counts = {color: sum(d.color == color for d in detections) for color in COLORS}
+        payload = {"frame": frame_number, "detections": len(detections), "ratios": ratios, "smoothed_ratios": smoother.update(counts), "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
+        print(json.dumps(payload), flush=True)
+        if args.display:
+            cv2.imshow("silent disco", annotated)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+    if args.display:
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,4 @@
+# Install common dependencies first with: pip install -r src/requirements.txt
+# This installs the Intel GPU-enabled PyTorch wheel, not the CUDA wheel.
+--index-url https://download.pytorch.org/whl/xpu
+torch==2.14.0+xpu
