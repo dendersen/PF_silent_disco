@@ -143,14 +143,24 @@ def crop_255(image_bgr: np.ndarray, x: int, y: int, size: int = 255) -> np.ndarr
 
 
 def crop_person_head(image_bgr: np.ndarray, box: tuple[int, int, int, int], size: int = 255) -> tuple[np.ndarray, tuple[int, int]]:
-    """Make a square, resized crop around the head end of a detected person box."""
-    x1, y1, x2, y2 = box
-    box_width, box_height = max(1, x2 - x1), max(1, y2 - y1)
-    crop_size = max(32, round(max(box_width * 0.9, box_height * 0.28)))
-    center_x = round((x1 + x2) / 2)
-    center_y = round(y1 + box_height * 0.18)
+    """Make the exact 255x255 source crop used by the classifiers."""
+    crop_x1, crop_y1, crop_x2, crop_y2 = person_head_crop_box(box)
+    crop_size = crop_x2 - crop_x1
+    center_x = crop_x1 + crop_size // 2
+    center_y = crop_y1 + crop_size // 2
     crop = crop_255(image_bgr, center_x, center_y, crop_size)
     return cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA), (center_x, center_y)
+
+
+def person_head_crop_box(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Return the exact 255-pixel source square sent to the classifiers."""
+    x1, y1, x2, y2 = box
+    box_height = max(1, y2 - y1)
+    crop_size = 255
+    center_x = round((x1 + x2) / 2)
+    center_y = round(y1 + box_height * 0.18)
+    half = crop_size // 2
+    return center_x - half, center_y - half, center_x - half + crop_size, center_y - half + crop_size
 
 
 class SmallConvNet(nn.Module):
@@ -295,11 +305,20 @@ def analyze_frame(image_bgr: np.ndarray, detector, presence_model: SmallConvNet 
     counts = {color: sum(detection.color == color for detection in detections) for color in COLORS}
     ratios = {color: counts[color] / max(1, sum(counts.values())) for color in COLORS}
     annotated = image_bgr.copy()
-    for detection in detections:
-        x1, y1, x2, y2 = detection.box
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 220, 0), 3)
-        cv2.circle(annotated, (detection.x, detection.y), 18, (0, 220, 0), 3)
-        cv2.putText(annotated, detection.color, (detection.x + 22, detection.y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    colors_bgr = {"green": (0, 200, 0), "blue": (220, 80, 0), "red": (0, 0, 220)}
+    accepted_by_box = {detection.box: detection for detection in detections}
+    for box, _ in people:
+        detection = accepted_by_box.get(box)
+        x1, y1, x2, y2 = box
+        color = colors_bgr.get(detection.color, (70, 70, 70)) if detection else (70, 70, 70)
+        label = detection.color if detection else "no headset"
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 3)
+        head_x1, head_y1, head_x2, head_y2 = person_head_crop_box(box)
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (head_x1, head_y1), (head_x2, head_y2), color, -1)
+        annotated = cv2.addWeighted(overlay, 0.22, annotated, 0.78, 0)
+        cv2.rectangle(annotated, (head_x1, head_y1), (head_x2, head_y2), color, 3)
+        cv2.putText(annotated, label, (head_x1, max(24, head_y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
     return detections, ratios, annotated
 
 

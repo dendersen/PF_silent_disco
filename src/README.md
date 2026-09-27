@@ -79,6 +79,8 @@ After training, generate the color-percentage CSV and plot for every video in a 
 python3 src/plot_video_percentages.py images --device rocm --detector-device cpu --every 3
 ```
 
+Add `--display-ai-frame` to open a live annotated frame window. Each detected human has a yellow outer box. The smaller, slightly filled inner box is the exact crop sent to the AI: dark gray when rejected by the presence model, or blue, green, or red when accepted and classified as that DJ color. The preview defaults to 1280×720; adjust it with `--display-width` and `--display-height`. Inference still uses the full-resolution frame. Press Escape to stop frame processing.
+
 The custom presence and color models run on ROCm. YOLO person detection defaults to CPU because its ROCm path can segfault on some PyTorch/Ultralytics combinations; use `--detector-device rocm` only when that stack is known to be stable. Unknown/no-color detections are excluded from the percentage denominator. The live window has a video selector on the right; choosing a video shows only that video's curves while processing continues.
 
 Each epoch displays a batch progress bar. The original `dataset` is never modified. The processed dataset remains on disk while all requested models train and is removed afterward when `delete_dataset_after_training` is enabled. Use `--processed-dataset` to choose another generated-data location.

@@ -89,7 +89,7 @@ class LivePlot:
         self.figure.savefig(path, dpi=160)
 
 
-def process_video(path: Path, detector, presence_model, color_model, device: torch.device, every: int, person_confidence: float, live_plot: LivePlot | None) -> list[dict[str, float | str]]:
+def process_video(path: Path, detector, presence_model, color_model, device: torch.device, every: int, person_confidence: float, live_plot: LivePlot | None, display_ai_frame: bool) -> list[dict[str, float | str]]:
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise ValueError(f"Could not open {path}")
@@ -106,7 +106,11 @@ def process_video(path: Path, detector, presence_model, color_model, device: tor
             if not ok:
                 break
             if frame_number % every == 0:
-                detections, ratios, _ = analyze_frame(frame, detector, presence_model, color_model, device, person_confidence=person_confidence)
+                detections, ratios, annotated = analyze_frame(frame, detector, presence_model, color_model, device, person_confidence=person_confidence)
+                if display_ai_frame:
+                    cv2.imshow("AI frame analysis", annotated)
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        raise KeyboardInterrupt
                 row: dict[str, float | str] = {"video": path.name, "time_seconds": frame_number / fps}
                 for color in COLORS:
                     row[color] = ratios[color] * 100.0
@@ -132,6 +136,9 @@ def main() -> None:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "rocm", "xpu"), default="auto")
     parser.add_argument("--every", type=int, default=3)
     parser.add_argument("--plot-every", type=int, default=5, help="Refresh the live plot after this many sampled frames.")
+    parser.add_argument("--display-ai-frame", action="store_true", help="Show the previous processed frame with headset classification boxes.")
+    parser.add_argument("--display-width", type=int, default=1280, help="Preview window width in pixels.")
+    parser.add_argument("--display-height", type=int, default=720, help="Preview window height in pixels.")
     parser.add_argument("--person-confidence", type=float, default=0.08)
     parser.add_argument("--output", type=Path, default=Path("models/video_color_percentages.png"))
     parser.add_argument("--csv", type=Path, default=Path("models/video_color_percentages.csv"))
@@ -150,7 +157,10 @@ def main() -> None:
     print(f"loading color model on {device}...", flush=True)
     color_model = load_model(args.color_model, 3, device)
     print("starting video inference...", flush=True)
-    rows = [row for video in videos for row in process_video(video, detector, presence_model, color_model, device, max(1, args.every), args.person_confidence, live_plot)]
+    if args.display_ai_frame:
+        cv2.namedWindow("AI frame analysis", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("AI frame analysis", max(320, args.display_width), max(240, args.display_height))
+    rows = [row for video in videos for row in process_video(video, detector, presence_model, color_model, device, max(1, args.every), args.person_confidence, live_plot, args.display_ai_frame)]
     print("writing CSV and plot...", flush=True)
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     with args.csv.open("w", newline="") as handle:
@@ -160,6 +170,8 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     live_plot.save(args.output)
     live_plot.close()
+    if args.display_ai_frame:
+        cv2.destroyWindow("AI frame analysis")
     print(f"processed_videos={len(videos)} samples={len(rows)} csv={args.csv} plot={args.output} device={device}")
 
 
