@@ -14,8 +14,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import cv2
+import torch
 
-from silent_disco import crop_255, find_candidate_points, preprocess_image
+from silent_disco import COLOR_MODEL_CLASSES, crop_255, crop_person_head, detect_people, load_model, load_person_detector, predict_probabilities, resolve_device
 
 
 PAGE = """<!doctype html>
@@ -33,7 +34,7 @@ h1 { margin-bottom: 4px; } #status { color: #52606d; margin-bottom: 16px; }
 .selection.green { background: rgba(21, 153, 87, .32); border-color: #159957; }
 .selection.blue { background: rgba(36, 99, 235, .32); border-color: #2463eb; }
 .selection.red { background: rgba(211, 63, 73, .32); border-color: #d33f49; }
-#zoom-panel { display: none; margin-top: 16px; } #zoom { width: 510px; max-width: 100%; image-rendering: auto; border: 2px solid #ccd6dd; }
+#zoom-panel { display: none; margin-top: 16px; } #zoom { width: 510px; max-width: 100%; image-rendering: auto; border: 2px solid #ccd6dd; } #prediction-note { color: #52606d; font-weight: bold; margin-top: 8px; }
 #buttons { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
 button { border: 0; border-radius: 4px; color: white; cursor: pointer; font-size: 16px; padding: 12px 18px; }
 button:disabled { cursor: not-allowed; opacity: .45; } .negative { background: #566573; }
@@ -57,7 +58,7 @@ button:disabled { cursor: not-allowed; opacity: .45; } .negative { background: #
   <button class="skip" data-label="skip">Next image</button>
     <button id="auto-review" class="skip" type="button">Review auto points</button>
 </div>
-<div id="zoom-panel"><div>Selected 255x255 crop</div><img id="zoom" alt="Enlarged selected crop"></div>
+<div id="zoom-panel"><div>Selected 255x255 crop</div><img id="zoom" alt="Enlarged selected crop"><div id="prediction-note"></div></div>
 <div id="hint">Click a point in the image, then choose its label. Label multiple points before selecting Next image.</div>
 <h2>Saved training crops</h2>
 <div id="gallery"></div>
@@ -72,6 +73,7 @@ const imageWrap = document.getElementById('image-wrap');
 let selection = document.getElementById('selection');
 const zoomPanel = document.getElementById('zoom-panel');
 const zoom = document.getElementById('zoom');
+const predictionNote = document.getElementById('prediction-note');
 const status = document.getElementById('status');
 const gallery = document.getElementById('gallery');
 const autoReviewButton = document.getElementById('auto-review');
@@ -85,7 +87,7 @@ async function refresh() {
     frame.dataset.cropWidth = data.crop_width; frame.dataset.cropHeight = data.crop_height;
     document.querySelectorAll('.selection').forEach(box => box.remove());
     selection = document.createElement('div'); selection.id = 'selection'; selection.className = 'selection'; imageWrap.appendChild(selection);
-    zoomPanel.style.display = 'none'; zoom.removeAttribute('src');
+    zoomPanel.style.display = 'none'; zoom.removeAttribute('src'); predictionNote.textContent = '';
   selected = null;
   status.textContent = `${data.index + 1}/${data.total}  ${data.name}  |  saved crops: ${data.saved}`;
   document.querySelectorAll('button').forEach(button => button.disabled = false);
@@ -138,7 +140,10 @@ async function startAutoReview() {
 function showReviewPoint() {
     const point = reviewPoints[reviewIndex];
     selectPoint(point.x, point.y);
-    status.textContent = `Auto-review ${reviewIndex + 1}/${reviewPoints.length}: choose a label for this point.`;
+    const presence = point.predicted_presence ? `${point.predicted_presence}${point.presence_confidence == null ? '' : ` (${Math.round(point.presence_confidence * 100)}%)`}` : 'unavailable';
+    const color = point.predicted_color ? `${point.predicted_color}${point.color_confidence == null ? '' : ` (${Math.round(point.color_confidence * 100)}%)`}` : 'unavailable';
+    predictionNote.textContent = `AI guess: ${presence}, color ${color}`;
+    status.textContent = `Auto-review ${reviewIndex + 1}/${reviewPoints.length}: choose the true label.`;
 }
 autoReviewButton.addEventListener('click', startAutoReview);
 async function editCrop(id, label) {
@@ -169,6 +174,7 @@ function selectPoint(displayX, displayY) {
     selection.style.top = `${imageBox.top - wrapBox.top + frame.clientTop + displayY / displayScaleY - cropHeight / 2}px`;
     selection.style.display = 'block'; selection.className = 'selection'; selection.dataset.labeled = 'false';
     zoom.src = `/preview?x=${selected.x}&y=${selected.y}&t=${Date.now()}`;
+    predictionNote.textContent = '';
     zoomPanel.style.display = 'block';
 }
 frame.addEventListener('click', event => {
@@ -216,7 +222,7 @@ refresh();
 
 
 class AnnotationApp:
-    def __init__(self, image_dir: Path, dataset_dir: Path, max_side: int = 1600) -> None:
+    def __init__(self, image_dir: Path, dataset_dir: Path, detector_model: Path, presence_model: Path | None, color_model: Path | None, predictor_device: str, detector_image_size: int = 1280, detector_tile_size: int = 3000, max_side: int = 1600) -> None:
         extensions = {".jpg", ".jpeg", ".png", ".bmp"}
         self.images = sorted(path for path in image_dir.iterdir() if path.suffix.lower() in extensions)
         self.videos = sorted(path for path in image_dir.iterdir() if path.suffix.lower() in {".mp4", ".mov", ".avi", ".mkv"})
@@ -224,6 +230,12 @@ class AnnotationApp:
             raise ValueError(f"No images or videos found in {image_dir}")
         self.dataset_dir = dataset_dir
         self.max_side = max_side
+        self.detector_image_size = detector_image_size
+        self.detector_tile_size = detector_tile_size
+        self.detector = load_person_detector(detector_model, torch.device("cpu"))
+        self.predictor_device = resolve_device(predictor_device)
+        self.presence_model = load_model(presence_model, 2, self.predictor_device)
+        self.color_model = load_model(color_model, len(COLOR_MODEL_CLASSES), self.predictor_device)
         self.sequence_index = 0
         self.current_path: Path | None = None
         self.current_image = None
@@ -297,24 +309,49 @@ class AnnotationApp:
             raise ValueError("Could not encode preview crop")
         return encoded.tobytes()
 
-    def auto_points(self) -> list[dict[str, int | float]]:
+    def auto_points(self) -> list[dict[str, int | float | str | None]]:
         _, image, source = self.current()
-        cleaned, mask = preprocess_image(image)
-        candidate_distance = max(5, round(60 * cleaned.shape[1] / image.shape[1]))
-        candidates = find_candidate_points(cleaned, mask, min_distance=candidate_distance, augment_corners=True)
-        scale_x = image.shape[1] / cleaned.shape[1]
-        scale_y = image.shape[0] / cleaned.shape[0]
+        people = detect_people(self.detector, image, confidence=0.03, image_size=self.detector_image_size, tile_size=self.detector_tile_size)
         display_scale = min(1.0, self.max_side / max(image.shape[:2]))
         existing = [(int(item["x"]), int(item["y"])) for item in self.annotations if item["source"] == source]
         selected = list(existing)
         points = []
-        for candidate in candidates:
-            x = round(candidate.x * scale_x)
-            y = round(candidate.y * scale_y)
+        crops = []
+        point_data = []
+        for box, score in people:
+            crop, (x, y) = crop_person_head(image, box)
             if any((x - old_x) ** 2 + (y - old_y) ** 2 < 60 ** 2 for old_x, old_y in selected):
                 continue
             selected.append((x, y))
-            points.append({"x": round(x * display_scale), "y": round(y * display_scale), "score": candidate.score})
+            crops.append(crop)
+            point_data.append({"x": round(x * display_scale), "y": round(y * display_scale), "score": score})
+        presence_predictions = predict_probabilities(self.presence_model, crops, self.predictor_device) if self.presence_model is not None else None
+        color_predictions = [None] * len(crops)
+        if self.color_model is not None:
+            color_indices = [index for index in range(len(crops)) if self.presence_model is None or float(presence_predictions[index, 1].item()) >= 0.5]
+            if color_indices:
+                predicted = predict_probabilities(self.color_model, [crops[index] for index in color_indices], self.predictor_device)
+                for prediction_index, crop_index in enumerate(color_indices):
+                    color_predictions[crop_index] = predicted[prediction_index]
+        for index, point in enumerate(point_data):
+            if presence_predictions is not None:
+                presence_probability = float(presence_predictions[index, 1].item())
+                if 0.4 <= presence_probability <= 0.6:
+                    point["predicted_presence"] = "uncertain"
+                else:
+                    point["predicted_presence"] = "headset" if presence_probability >= 0.5 else "no headset"
+                point["presence_confidence"] = round(max(presence_probability, 1.0 - presence_probability), 3)
+            else:
+                point["predicted_presence"] = None
+                point["presence_confidence"] = None
+            if color_predictions[index] is not None:
+                color_index = int(color_predictions[index].argmax().item())
+                point["predicted_color"] = COLOR_MODEL_CLASSES[color_index]
+                point["color_confidence"] = round(float(color_predictions[index][color_index].item()), 3)
+            else:
+                point["predicted_color"] = "not evaluated"
+                point["color_confidence"] = None
+            points.append(point)
         return points
 
     def save(self, label: str, display_x: int, display_y: int) -> None:
@@ -437,10 +474,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Label headset points and save 255x255 training crops.")
     parser.add_argument("image_dir", type=Path)
     parser.add_argument("--dataset", type=Path, default=Path("dataset"))
+    parser.add_argument("--detector-model", type=Path, default=Path("models/yolo11n.pt"))
+    parser.add_argument("--presence-model", type=Path, default=Path("models/presence.pt"))
+    parser.add_argument("--color-model", type=Path, default=Path("models/color.pt"))
+    parser.add_argument("--predictor-device", choices=("auto", "cpu", "cuda", "rocm", "xpu"), default="cpu")
+    parser.add_argument("--detector-image-size", type=int, default=1280)
+    parser.add_argument("--detector-tile-size", type=int, default=3000)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--open", action="store_true", help="Open the annotation page in the default browser.")
     args = parser.parse_args()
-    app = AnnotationApp(args.image_dir, args.dataset)
+    app = AnnotationApp(args.image_dir, args.dataset, args.detector_model, args.presence_model, args.color_model, args.predictor_device, args.detector_image_size, args.detector_tile_size)
     Handler.app = app
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}/"

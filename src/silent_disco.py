@@ -17,6 +17,7 @@ from torch import nn
 
 COLORS = ("green", "blue", "red")
 COLOR_CLASSES = ("green", "blue", "red", "unknown")
+COLOR_MODEL_CLASSES = COLORS
 
 
 @dataclass(frozen=True)
@@ -62,14 +63,18 @@ def resolve_device(requested: str = "auto") -> torch.device:
         return torch.device("cpu")
     if requested == "rocm":
         if rocm_available():
+            print(f"Using ROCm device", torch.cuda.get_device_name(torch.cuda.current_device()))
             return torch.device("cuda")
         raise RuntimeError("Requested device 'rocm' requires a ROCm-enabled PyTorch build and an available AMD GPU")
     if requested in {"cuda", "auto"} and torch.cuda.is_available():
+        print(f"Using CUDA device", torch.cuda.get_device_name(torch.cuda.current_device()))
         return torch.device("cuda")
     if requested in {"xpu", "auto"} and hasattr(torch, "xpu") and torch.xpu.is_available():
+        print("Using Intel XPU device", torch.xpu.get_device_name(torch.xpu.current_device()))
         return torch.device("xpu")
     if requested != "auto":
         raise RuntimeError(f"Requested device '{requested}' is not available in this PyTorch installation")
+    print("Using CPU device")
     return torch.device("cpu")
 
 
@@ -149,14 +154,16 @@ def crop_person_head(image_bgr: np.ndarray, box: tuple[int, int, int, int], size
 
 
 class SmallConvNet(nn.Module):
+    """Compact crop classifier with enough capacity for detector-centered crops."""
+
     def __init__(self, classes: int) -> None:
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 5, stride=2, padding=2), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(3, 32, 5, stride=2, padding=2), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1),
         )
-        self.classifier = nn.Sequential(nn.Flatten(), nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, classes))
+        self.classifier = nn.Sequential(nn.Flatten(), nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, classes))
 
     def forward(self, batch: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.features(batch))
@@ -166,33 +173,64 @@ def load_model(path: Path | None, classes: int, device: torch.device) -> SmallCo
     if path is None or not path.exists():
         return None
     model = SmallConvNet(classes).to(device)
-    model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+    try:
+        model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+    except RuntimeError as error:
+        raise RuntimeError(f"Checkpoint {path} was built with an older model size; retrain it with src/train_models.py") from error
     model.eval()
     return model
 
 
-def load_person_detector(path: Path, device: torch.device):
+def load_person_detector(path: Path, device: torch.device | None = None):
     """Load a pretrained detector and configure it to return people only."""
     try:
         from ultralytics import YOLO
     except ImportError as error:
         raise RuntimeError("Person detection requires ultralytics; install src/requirements.txt") from error
     detector = YOLO(str(path))
-    detector.to(str(device))
+    if device is not None:
+        detector.to(str(device))
     return detector
 
 
-def detect_people(detector, image_bgr: np.ndarray, confidence: float = 0.25) -> list[tuple[tuple[int, int, int, int], float]]:
-    """Return person boxes from YOLO, clipped to the source image."""
-    result = detector.predict(image_bgr, classes=[0], conf=confidence, verbose=False)[0]
+def detect_people(
+    detector,
+    image_bgr: np.ndarray,
+    confidence: float = 0.08,
+    image_size: int = 1280,
+    tile_size: int = 3000,
+    tile_overlap: float = 0.2,
+) -> list[tuple[tuple[int, int, int, int], float]]:
+    """Return person boxes using overlapping tiles so small people are not lost."""
     height, width = image_bgr.shape[:2]
-    detections = []
-    for coordinates, score in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy()):
-        x1, y1, x2, y2 = (round(float(value)) for value in coordinates)
-        box = (max(0, x1), max(0, y1), min(width - 1, x2), min(height - 1, y2))
-        if box[2] > box[0] and box[3] > box[1]:
-            detections.append((box, float(score)))
-    return detections
+    tile_size = max(0, tile_size)
+    if not tile_size or (width <= tile_size and height <= tile_size):
+        tiles = [(0, 0, image_bgr)]
+    else:
+        step = max(1, round(tile_size * (1.0 - min(0.8, max(0.0, tile_overlap)))))
+        tiles = []
+        bottom = height
+        for top in range(0, height, step):
+            for left in range(0, width, step):
+                right, bottom = min(width, left + tile_size), min(height, top + tile_size)
+                tiles.append((left, top, image_bgr[top:bottom, left:right]))
+                if right == width:
+                    break
+            if bottom == height:
+                break
+
+    boxes: list[list[int]] = []
+    scores: list[float] = []
+    for left, top, tile in tiles:
+        result = detector.predict(tile, classes=[0], conf=confidence, imgsz=image_size, max_det=300, verbose=False)[0]
+        for coordinates, score in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy()):
+            x1, y1, x2, y2 = (round(float(value)) for value in coordinates)
+            box = [max(0, x1 + left), max(0, y1 + top), min(width - 1, x2 + left), min(height - 1, y2 + top)]
+            if box[2] > box[0] and box[3] > box[1]:
+                boxes.append([box[0], box[1], box[2] - box[0], box[3] - box[1]])
+                scores.append(float(score))
+    selected = cv2.dnn.NMSBoxes(boxes, scores, confidence, 0.45) if boxes else []
+    return [((boxes[index][0], boxes[index][1], boxes[index][0] + boxes[index][2], boxes[index][1] + boxes[index][3]), scores[index]) for index in (int(item) for item in selected)]
 
 
 def tensor_from_bgr(crop: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -226,8 +264,8 @@ def heuristic_color(crop: np.ndarray) -> tuple[str, float]:
     return (color, min(1.0, scores[color] * 8.0)) if scores[color] >= 0.01 else ("unknown", 0.0)
 
 
-def analyze_frame(image_bgr: np.ndarray, detector, presence_model: SmallConvNet | None, color_model: SmallConvNet | None, device: torch.device, presence_threshold: float = 0.35, person_confidence: float = 0.08, verify_presence: bool = False) -> tuple[list[Detection], dict[str, float], np.ndarray]:
-    people = detect_people(detector, image_bgr, person_confidence)
+def analyze_frame(image_bgr: np.ndarray, detector, presence_model: SmallConvNet | None, color_model: SmallConvNet | None, device: torch.device, presence_threshold: float = 0.5, person_confidence: float = 0.08, verify_presence: bool = True, detector_image_size: int = 1280, detector_tile_size: int = 3000, detector_tile_overlap: float = 0.2) -> tuple[list[Detection], dict[str, float], np.ndarray]:
+    people = detect_people(detector, image_bgr, person_confidence, detector_image_size, detector_tile_size, detector_tile_overlap)
     crops = []
     points = []
     boxes = []
@@ -245,11 +283,11 @@ def analyze_frame(image_bgr: np.ndarray, detector, presence_model: SmallConvNet 
     accepted = [(point, box, crop, presence) for point, box, crop, presence in zip(points, boxes, crops, presence_scores) if not verify_presence or presence >= presence_threshold]
     if color_model is None:
         color_predictions = [heuristic_color(crop) for _, _, crop, _ in accepted]
-    elif accepted:
+    elif accepted and presence_model is not None and verify_presence:
         probabilities = predict_probabilities(color_model, [crop for _, _, crop, _ in accepted], device)
-        color_predictions = [(COLOR_CLASSES[int(torch.argmax(probability).item())], float(torch.max(probability).item())) for probability in probabilities]
+        color_predictions = [(COLOR_MODEL_CLASSES[int(torch.argmax(probability).item())], float(torch.max(probability).item())) for probability in probabilities]
     else:
-        color_predictions = []
+        color_predictions = [("unknown", 0.0) for _ in accepted]
     detections: list[Detection] = []
     for (point, box, _, presence), (color, color_confidence) in zip(accepted, color_predictions):
         x, y = point
@@ -293,7 +331,8 @@ def main() -> None:
     parser.add_argument("--color-model", type=Path)
     parser.add_argument("--detector-model", type=Path, default=Path("models/yolo11n.pt"), help="YOLO person detector checkpoint; downloaded by Ultralytics when absent.")
     parser.add_argument("--person-confidence", type=float, default=0.08)
-    parser.add_argument("--verify-presence", action="store_true", help="Also filter detector boxes with the legacy headset presence model.")
+    parser.add_argument("--skip-presence", action="store_true", help="Skip presence-model filtering; color prediction will receive every detector crop.")
+    parser.add_argument("--presence-threshold", type=float, default=0.5)
     parser.add_argument("--every", type=int, default=3, help="Analyze every Nth video frame.")
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "rocm", "xpu"), default="auto")
@@ -301,11 +340,11 @@ def main() -> None:
     device = resolve_device(args.device)
     detector = load_person_detector(args.detector_model, device)
     presence_model = load_model(args.presence_model, 2, device)
-    color_model = load_model(args.color_model, len(COLOR_CLASSES), device)
+    color_model = load_model(args.color_model, len(COLOR_MODEL_CLASSES), device)
     smoother = RatioSmoother()
     for frame_number, frame in iter_frames(args.input, max(1, args.every)):
         started = time.perf_counter()
-        detections, ratios, annotated = analyze_frame(frame, detector, presence_model, color_model, device, person_confidence=args.person_confidence, verify_presence=args.verify_presence)
+        detections, ratios, annotated = analyze_frame(frame, detector, presence_model, color_model, device, presence_threshold=args.presence_threshold, person_confidence=args.person_confidence, verify_presence=not args.skip_presence)
         counts = {color: sum(d.color == color for d in detections) for color in COLORS}
         payload = {"frame": frame_number, "detections": len(detections), "ratios": ratios, "smoothed_ratios": smoother.update(counts), "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
         print(json.dumps(payload), flush=True)

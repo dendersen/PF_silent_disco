@@ -17,6 +17,8 @@ then CPU. Use `--device cuda`, `--device rocm`, `--device xpu`, or `--device cpu
 specific backend; unavailable explicit devices produce an error instead of
 silently running on the CPU.
 
+The color and presence classifiers use a widened 32→64→128 channel CNN. Existing checkpoints from the previous smaller architecture must be retrained before inference.
+
 On an Intel Arc Linux host, install the explicit XPU build and verify the backend before running:
 
 ```bash
@@ -43,10 +45,9 @@ dataset/
   color/green/*.jpg
   color/blue/*.jpg
   color/red/*.jpg
-  color/unknown/*.jpg
 ```
 
-Training automatically generates augmented crops in memory from `generate.settings`. Each variant can add bounded pixel noise, move the crop center in both axes, and simulate smoke by reducing saturation and increasing brightness:
+Before training, augmented crops are written to `dataset_processed` from `generate.settings`. Each variant can add bounded pixel noise, move the crop center in both axes, and simulate smoke by reducing saturation and increasing brightness:
 
 ```ini
 [generate]
@@ -66,7 +67,21 @@ python3 src/train_models.py dataset
 python3 src/train_models.py dataset --kind color --output models/color.pt
 ```
 
-Each epoch displays a batch progress bar. Augmentation is normally in memory, so the source `dataset` is never deleted. If training is pointed at the legacy generated directory named `dataset_processed`, it is removed after all requested models save when `delete_dataset_after_training` is enabled.
+For ROCm training, use the ROCm PyTorch environment explicitly:
+
+```bash
+python3 src/train_models.py dataset --device rocm --epochs 25
+```
+
+After training, generate the color-percentage CSV and plot for every video in a directory:
+
+```bash
+python3 src/plot_video_percentages.py images --device rocm --detector-device cpu --every 3
+```
+
+The custom presence and color models run on ROCm. YOLO person detection defaults to CPU because its ROCm path can segfault on some PyTorch/Ultralytics combinations; use `--detector-device rocm` only when that stack is known to be stable. Unknown/no-color detections are excluded from the percentage denominator. The live window has a video selector on the right; choosing a video shows only that video's curves while processing continues.
+
+Each epoch displays a batch progress bar. The original `dataset` is never modified. The processed dataset remains on disk while all requested models train and is removed afterward when `delete_dataset_after_training` is enabled. Use `--processed-dataset` to choose another generated-data location.
 
 Create those crops with the browser annotator. Click a headset or other point
 in the image, then choose a button. `No headset` creates a negative presence
@@ -76,17 +91,23 @@ the next image:
 The saved-crop gallery below the image lets you inspect every crop, change its
 label, or remove it from both training datasets.
 
-Use `Review auto points` to run the detector's candidate-point stage on the
-current image. The annotator presents each new candidate one at a time; choose
-its label and it advances automatically. After the final point, normal manual
-clicking resumes for the same image.
+Use `Review auto points` to run the YOLO person detector on the current image.
+Each detected person's head crop is presented one at a time; choose its label
+and it advances automatically. After the final point, normal manual clicking
+resumes for the same image. The annotator uses the CPU detector by default to
+avoid the known YOLO ROCm crash.
 
 Auto-review points are separated by at least 60 pixels in the original image,
 and corner candidates are added when color blobs are sparse.
 
 ```bash
-python3 src/annotate_training.py images --dataset dataset --open
+python3 src/annotate_training.py images --dataset dataset --detector-model models/yolo11n.pt --open
 ```
+
+Auto-review uses overlapping 3000-pixel tiles and a 1280-pixel YOLO input by default, with a 0.03 person confidence threshold to recover small people. Adjust these with `--detector-tile-size` and `--detector-image-size` if needed.
+
+During auto-review, the annotator also shows the trained presence and color model predictions with confidence values. These are advisory; the label you choose remains the training ground truth. Use `--presence-model`, `--color-model`, and `--predictor-device` to select the checkpoints and prediction device.
+Presence predictions between 40% and 60% are shown as `uncertain` rather than being reported as a confident headset/no-headset decision. The color model only receives crops that pass the presence threshold, and no-headset/unknown crops are excluded from color training.
 The next-image action alternates between a randomly selected still image and a
 random frame from a randomly selected video. If port `8765` is already in use,
 choose another port, for example `--port 8766`.

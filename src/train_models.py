@@ -3,7 +3,7 @@
 Expected dataset layout:
   dataset/presence/negative/*.jpg
   dataset/presence/headset/*.jpg
-  dataset/color/green/*.jpg, blue/*.jpg, red/*.jpg, unknown/*.jpg
+    dataset/color/green/*.jpg, blue/*.jpg, red/*.jpg
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import configparser
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -23,8 +25,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from generate_datapoints import augment_image
-from silent_disco import COLOR_CLASSES, SmallConvNet, resolve_device
+from generate_datapoints import augment_dataset
+from silent_disco import COLORS, SmallConvNet, resolve_device
 
 
 @dataclass(frozen=True)
@@ -62,30 +64,17 @@ def load_generate_settings(path: Path) -> GenerateSettings:
 
 
 class CropDataset(Dataset[tuple[torch.Tensor, int]]):
-    def __init__(self, root: Path, labels: tuple[str, ...], generate: GenerateSettings) -> None:
+    def __init__(self, root: Path, labels: tuple[str, ...]) -> None:
         self.items = [(path, index) for index, label in enumerate(labels) for path in sorted((root / label).glob("*"))]
-        self.generate = generate
-        self.base_length = len(self.items)
 
     def __len__(self) -> int:
-        multiplier = self.generate.iterations + 1 if self.generate.enabled else 1
-        return self.base_length * multiplier
+        return len(self.items)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        source_index = index % self.base_length
-        iteration = index // self.base_length
-        path, label = self.items[source_index]
+        path, label = self.items[index]
         image = cv2.imread(str(path))
         if image is None:
             raise ValueError(f"Could not read {path}")
-        if self.generate.enabled and iteration:
-            image = augment_image(
-                image,
-                np.random.default_rng(self.generate.seed + index),
-                self.generate.noise_strength,
-                self.generate.max_shift,
-                self.generate.smoke_strength,
-            )
         image = cv2.cvtColor(cv2.resize(image, (255, 255)), cv2.COLOR_BGR2RGB)
         array = (image.astype(np.float32) / 255.0 - 0.5) / 0.5
         return torch.from_numpy(array.transpose(2, 0, 1)), label
@@ -99,11 +88,11 @@ def wait_for_enter(stop_event: threading.Event) -> None:
         return
 
 
-def train(root: Path, labels: tuple[str, ...], output: Path, epochs: int, batch_size: int, target_loss: float | None, max_time: float | None, generate: GenerateSettings) -> None:
-    dataset = CropDataset(root, labels, generate)
+def train(root: Path, labels: tuple[str, ...], output: Path, epochs: int, batch_size: int, target_loss: float | None, max_time: float | None, requested_device: str) -> None:
+    dataset = CropDataset(root, labels)
     if not dataset:
         raise ValueError(f"No training crops found under {root}")
-    device = resolve_device("auto")
+    device = resolve_device(requested_device)
     model = SmallConvNet(len(labels)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     loss_function = nn.CrossEntropyLoss()
@@ -113,7 +102,7 @@ def train(root: Path, labels: tuple[str, ...], output: Path, epochs: int, batch_
     started = time.monotonic()
     epoch = 0
     stop_reason = "user"
-    print(f"Training {len(dataset)} crops ({len(dataset) // (generate.iterations + 1 if generate.enabled else 1)} originals, augmentation={'on' if generate.enabled else 'off'})")
+    print(f"Training {len(dataset)} processed crops")
     print("Press Enter to stop training.")
     while True:
         if stop_event.is_set():
@@ -129,7 +118,7 @@ def train(root: Path, labels: tuple[str, ...], output: Path, epochs: int, batch_
         model.train()
         total_loss = 0.0
         samples_seen = 0
-        progress = tqdm(loader, desc=f"epoch {epoch}/{epochs or '∞'}", unit="batch")
+        progress = tqdm(loader, desc=f"epoch {epoch}/{epochs or '∞'}", unit="batch", leave=False)
         for images, targets in progress:
             if stop_event.is_set() or (max_time is not None and time.monotonic() - started >= max_time):
                 break
@@ -158,12 +147,14 @@ def train(root: Path, labels: tuple[str, ...], output: Path, epochs: int, batch_
     print(f"saved {output} after {epoch} epochs (stop={stop_reason})")
 
 
-def main() -> None:
+def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--kind", choices=("presence", "color"), help="Train one model; omit to train both.")
     parser.add_argument("--output", type=Path, default=Path("models"), help="Model file for one kind, or output directory when training both.")
     parser.add_argument("--settings", type=Path, default=Path("generate.settings"), help="Augmentation settings file.")
+    parser.add_argument("--processed-dataset", type=Path, default=Path("dataset_processed"), help="Temporary on-disk augmented dataset.")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "rocm", "xpu"), default="auto")
     parser.add_argument("--epochs", type=int, default=12, help="Maximum epochs; 0 means no epoch limit.")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--target-loss", type=float, help="Stop when the epoch average loss reaches this value.")
@@ -173,13 +164,37 @@ def main() -> None:
     kinds = (args.kind,) if args.kind else ("presence", "color")
     if len(kinds) > 1 and args.output.suffix:
         parser.error("--output must be a directory when --kind is omitted")
+    print(f"Generating processed dataset at {args.processed_dataset}...", flush=True)
     for kind in kinds:
-        labels = ("negative", "headset") if kind == "presence" else COLOR_CLASSES
-        output = args.output if args.kind else args.output / f"{kind}.pt"
-        train(args.dataset / kind, labels, output, args.epochs, args.batch_size, args.target_loss, args.max_time, generate)
-    if generate.delete_dataset_after_training and args.dataset.name == "dataset_processed" and args.dataset.is_dir():
-        shutil.rmtree(args.dataset)
-        print(f"deleted temporary dataset {args.dataset}")
+        source_labels = ("negative", "headset") if kind == "presence" else COLORS
+        processed_kind = args.processed_dataset / kind
+        if processed_kind.exists() and any(processed_kind.iterdir()):
+            print(f"{kind}: reusing existing processed data at {processed_kind}", flush=True)
+        else:
+            originals, generated = augment_dataset(args.dataset / kind, processed_kind, generate.iterations if generate.enabled else 0, generate.noise_strength, generate.max_shift, generate.smoke_strength, generate.seed, True, source_labels)
+            print(f"{kind}: copied={originals} augmented={generated}", flush=True)
+    for kind in kinds:
+        print(f"Training {kind} model...")
+        labels = ("negative", "headset") if kind == "presence" else COLORS
+        output = args.output / f"{kind}.pt" if args.output.is_dir() or not args.output.suffix else args.output
+        train(args.processed_dataset / kind, labels, output, args.epochs, args.batch_size, args.target_loss, args.max_time, args.device)
+        print(f"Finished training {kind} model.")
+    if generate.delete_dataset_after_training and args.processed_dataset.is_dir():
+        print("Deleting temporary dataset after training...")
+        shutil.rmtree(args.processed_dataset, ignore_errors=True)
+        print(f"deleted temporary dataset {args.processed_dataset}")
+
+
+def restore_terminal_echo() -> None:
+    if sys.stdin.isatty():
+        subprocess.run(("stty", "echo"), stdin=sys.stdin, check=False)
+
+
+def main() -> None:
+    try:
+        _main()
+    finally:
+        restore_terminal_echo()
 
 
 if __name__ == "__main__":

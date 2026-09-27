@@ -1,4 +1,5 @@
 # Install common dependencies first with: pip install -r src/requirements.txt
-# Replace rocm6.3 with the ROCm version installed on the target machine.
---index-url https://download.pytorch.org/whl/rocm6.3
-torch>=2.4
+# The host uses ROCm 7.x; PyTorch exposes ROCm through its CUDA API.
+--index-url https://download.pytorch.org/whl/rocm7.0
+torch==2.10.0+rocm7.0
+torchvision==0.25.0+rocm7.0

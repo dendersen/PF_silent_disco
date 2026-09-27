@@ -73,6 +73,7 @@ def augment_dataset(
     smoke_strength: float,
     seed: int,
     include_originals: bool,
+    include_labels: tuple[str, ...] | None = None,
 ) -> tuple[int, int]:
     if destination.exists() and any(destination.iterdir()):
         raise ValueError(f"Destination is not empty: {destination}")
@@ -83,6 +84,8 @@ def augment_dataset(
     originals = 0
     generated = 0
     for label_dir in sorted(path for path in source.iterdir() if path.is_dir()):
+        if include_labels is not None and label_dir.name not in include_labels:
+            continue
         target_dir = destination / label_dir.name
         target_dir.mkdir(parents=True, exist_ok=True)
         for path in sorted(label_dir.iterdir()):
