@@ -133,7 +133,7 @@ class App:
     def status(self): return {'running':bool(self.job and self.job.poll() is None),'kind':self.job_kind,'log':''.join(self.job_log)[-12000:],'status':'running' if self.job and self.job.poll() is None else ('finished' if self.job else 'idle')}
     def train(self, kind):
         if self.job and self.job.poll() is None:return
-        cmd=[sys.executable,'src/train_models.py',str(self.dataset),'--kind','head','--device','cpu','--epochs','15'] if kind=='head' else [sys.executable,'src/train_models.py',str(self.dataset),'--kind',kind,'--device','cpu','--epochs','15']; self.job_kind=kind; self.job_log=[]; self.job=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1); threading.Thread(target=self.read,daemon=True).start()
+        cmd=[sys.executable,'src/train_models.py',str(self.dataset),'--kind','head','--device','cpu','--head-batch-size','1','--head-image-size','640','--epochs','15'] if kind=='head' else [sys.executable,'src/train_models.py',str(self.dataset),'--kind',kind,'--device','cpu','--epochs','15']; self.job_kind=kind; self.job_log=[]; self.job=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1); threading.Thread(target=self.read,daemon=True).start()
     def read(self):
         if self.job and self.job.stdout:
             for line in self.job.stdout:self.job_log.append(line)

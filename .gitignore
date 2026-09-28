@@ -4,4 +4,6 @@
 /dataset_processed/*
 !/dataset_processed/.gitkeep
 /images
+/runs
+/weights
 src/__pycache__/*

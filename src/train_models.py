@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import configparser
-import os
 import shutil
 import subprocess
 import sys
@@ -84,7 +83,7 @@ class CropDataset(Dataset[tuple[torch.Tensor, int]]):
         return torch.from_numpy(array.transpose(2, 0, 1)), label
 
 
-def prepare_head_dataset(source: Path, destination: Path, settings: GenerateSettings) -> tuple[int, int]:
+def prepare_head_dataset(source: Path, destination: Path, settings: GenerateSettings, max_side: int | None = None) -> tuple[int, int]:
     """Copy head images and augment pixels without changing YOLO boxes."""
     if destination.exists():
         shutil.rmtree(destination)
@@ -99,32 +98,41 @@ def prepare_head_dataset(source: Path, destination: Path, settings: GenerateSett
     source_labels = source / "labels"
     if not source_images.is_dir() or not source_labels.is_dir():
         raise ValueError(f"Head dataset requires {source_images} and {source_labels}")
-    for image_path in sorted(source_images.iterdir()):
-        if image_path.suffix.lower() not in HEAD_IMAGE_EXTENSIONS:
-            continue
+    image_paths = sorted(path for path in source_images.iterdir() if path.suffix.lower() in HEAD_IMAGE_EXTENSIONS)
+    size_note = f"at up to {max_side}px" if max_side else "at original resolution"
+    variant_count = settings.iterations if settings.enabled else 0
+    progress = tqdm(total=len(image_paths) * (variant_count + 1), desc=f"Preparing head data {size_note}", unit="image")
+    for image_path in image_paths:
         label_path = source_labels / f"{image_path.stem}.txt"
         image = cv2.imread(str(image_path))
         if image is None or not label_path.exists():
             continue
-        shutil.copy2(image_path, image_destination / image_path.name)
+        height, width = image.shape[:2]
+        scale = min(1.0, max_side / max(height, width)) if max_side else 1.0
+        processed_image = cv2.resize(image, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA) if scale < 1 else image
+        if not cv2.imwrite(str(image_destination / image_path.name), processed_image):
+            raise ValueError(f"Could not write {image_destination / image_path.name}")
         shutil.copy2(label_path, label_destination / label_path.name)
         originals += 1
+        progress.update(1)
         if not settings.enabled:
             continue
         for iteration in range(settings.iterations):
-            augmented = augment_image(image, rng, settings.noise_strength, 0, settings.smoke_strength)
+            augmented = augment_image(processed_image, rng, settings.noise_strength, 0, settings.smoke_strength)
             output_name = f"{image_path.stem}__aug{iteration:03d}{image_path.suffix.lower()}"
             output_path = image_destination / output_name
             if not cv2.imwrite(str(output_path), augmented):
                 raise ValueError(f"Could not write {output_path}")
             shutil.copy2(label_path, label_destination / f"{Path(output_name).stem}.txt")
             generated += 1
+            progress.update(1)
+    progress.close()
     if originals == 0:
         raise ValueError(f"No labeled head images found under {source}")
     return originals, generated
 
 
-def train_head_detector(source: Path, processed: Path, epochs: int, settings: GenerateSettings) -> None:
+def train_head_detector(source: Path, processed: Path, epochs: int, settings: GenerateSettings, requested_device: str, batch_size: int, image_size: int) -> None:
     """Train a one-class YOLO head detector on processed head data."""
     originals, generated = prepare_head_dataset(source, processed, settings)
     print(f"Prepared head data: copied={originals} augmented={generated}", flush=True)
@@ -140,8 +148,27 @@ def train_head_detector(source: Path, processed: Path, epochs: int, settings: Ge
         from ultralytics import YOLO
     except ImportError as error:
         raise RuntimeError("Head training requires ultralytics; install src/requirements.txt") from error
-    model = YOLO("yolo11n.pt")
-    model.train(data=str(yaml_path), epochs=min(15, max(1, epochs)), imgsz=1280, device="cpu", project="models", name="head-detector", exist_ok=True)
+    base_checkpoint = Path("models/yolo11n.pt")
+    base_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    model = YOLO(str(base_checkpoint))
+    device = resolve_device(requested_device)
+    training_device = torch.device("cpu") if requested_device == "rocm" else device
+    if requested_device == "rocm":
+        print("ROCm YOLO training is disabled because the detector backend can segfault; using CPU for the head detector.", flush=True)
+    print(f"Starting YOLO head training on {training_device}...", flush=True)
+    model.train(
+        data=str(yaml_path),
+        epochs=min(15, max(1, epochs)),
+        imgsz=image_size,
+        batch=max(1, batch_size),
+        device=str(training_device),
+        workers=0,
+        cache=False,
+        amp=False,
+        project="models",
+        name="head-detector",
+        exist_ok=True,
+    )
     print("saved models/head-detector/weights/best.pt", flush=True)
 
 
@@ -215,28 +242,27 @@ def train(root: Path, labels: tuple[str, ...], output: Path, epochs: int, batch_
 def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path)
-    parser.add_argument("--kind", choices=("head", "presence", "color"), help="Train one model; omit to train presence and color.")
+    parser.add_argument("--kind", choices=("head", "presence", "color"), help="Train one model; omit to train all models.")
     parser.add_argument("--output", type=Path, default=Path("models"), help="Model file for one kind, or output directory when training both.")
     parser.add_argument("--settings", type=Path, default=Path("generate.settings"), help="Augmentation settings file.")
     parser.add_argument("--processed-dataset", type=Path, default=Path("dataset_processed"), help="Temporary on-disk augmented dataset.")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "rocm", "xpu"), default="auto")
     parser.add_argument("--epochs", type=int, default=12, help="Maximum epochs; 0 means no epoch limit.")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--head-batch-size", type=int, default=1, help="YOLO head-detector batch size; keep small on ROCm.")
+    parser.add_argument("--head-image-size", type=int, default=640, help="YOLO head-detector training image size.")
     parser.add_argument("--target-loss", type=float, help="Stop when the epoch average loss reaches this value.")
     parser.add_argument("--max-time", type=float, help="Stop after this many seconds.")
     args = parser.parse_args()
     generate = load_generate_settings(args.settings)
-    kinds = (args.kind,) if args.kind else ("presence", "color")
+    kinds = (args.kind,) if args.kind else ("presence", "color","head")
     if len(kinds) > 1 and args.output.suffix:
         parser.error("--output must be a directory when --kind is omitted")
-    if kinds == ("head",):
-        train_head_detector(args.dataset / "heads", args.processed_dataset / "head", args.epochs, generate)
-        if generate.delete_dataset_after_training and args.processed_dataset.is_dir():
-            shutil.rmtree(args.processed_dataset, ignore_errors=True)
-        return
-
+    print(f"Training models for [{', '.join(kinds)}]", flush=True)
     print(f"Generating processed dataset at {args.processed_dataset}...", flush=True)
     for kind in kinds:
+        if kind not in ("presence", "color"):
+            continue
         source_labels = ("negative", "headset") if kind == "presence" else COLORS
         processed_kind = args.processed_dataset / kind
         if processed_kind.exists() and any(processed_kind.iterdir()):
@@ -246,6 +272,9 @@ def _main() -> None:
             print(f"{kind}: copied={originals} augmented={generated}", flush=True)
     for kind in kinds:
         print(f"Training {kind} model...")
+        if kind in ("head"):
+            train_head_detector(args.dataset / "heads", args.processed_dataset / "head", args.epochs, generate, args.device, args.head_batch_size, args.head_image_size)
+            continue
         labels = ("negative", "headset") if kind == "presence" else COLORS
         output = args.output / f"{kind}.pt" if args.output.is_dir() or not args.output.suffix else args.output
         train(args.processed_dataset / kind, labels, output, args.epochs, args.batch_size, args.target_loss, args.max_time, args.device)
@@ -253,7 +282,8 @@ def _main() -> None:
     if generate.delete_dataset_after_training and args.processed_dataset.is_dir():
         print("Deleting temporary dataset after training...")
         shutil.rmtree(args.processed_dataset, ignore_errors=True)
-        open(os.path.join(args.processed_dataset, ".gitkeep"), "a").close()
+        args.processed_dataset.mkdir(parents=True, exist_ok=True)
+        (args.processed_dataset / ".gitkeep").touch()
         print(f"deleted temporary dataset {args.processed_dataset}")
 
 

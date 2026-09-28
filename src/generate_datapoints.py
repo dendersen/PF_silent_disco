@@ -15,6 +15,8 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 def crop_with_shift(image: np.ndarray, shift_x: int, shift_y: int) -> np.ndarray:
     """Shift the crop center while preserving the original crop dimensions."""
+    if shift_x == 0 and shift_y == 0:
+        return image.copy()
     height, width = image.shape[:2]
     padded = cv2.copyMakeBorder(image, height, height, width, width, cv2.BORDER_REFLECT_101)
     center_x = width + width // 2 + shift_x
