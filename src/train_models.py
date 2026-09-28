@@ -131,9 +131,31 @@ def prepare_head_dataset(source: Path, destination: Path, settings: GenerateSett
         raise ValueError(f"No labeled head images found under {source}")
     return originals, generated
 
+def head_rocm_known_broken() -> bool:
+    """Check if the current ROCm version is known to be broken for YOLO training."""
+    version = torch.version.hip
+    if version is None:
+        return True  # Not running on ROCm, so considered broken
+    known_broken_versions:list[str] = []
+    for v in range(0,6):
+        known_broken_versions.append(f"{v}.")
+    known_broken_versions.append("7.0.51831")
+    return any(version.startswith(broken) for broken in known_broken_versions)
 
-def train_head_detector(source: Path, processed: Path, epochs: int, settings: GenerateSettings, requested_device: str, batch_size: int, image_size: int) -> None:
+def train_head_detector(source: Path, processed: Path, epochs: int, settings: GenerateSettings, requested_device: str, batch_size: int, image_size: int, is_subprocess: bool) -> None:
     """Train a one-class YOLO head detector on processed head data."""
+    if requested_device == "rocm":
+        if head_rocm_known_broken():
+            if is_subprocess:
+                raise RuntimeError(f"ROCm version is known to be broken for YOLO training, but this is supposed to be a known-good call!\nPlease check your ROCm version and try again.\nactuall: \"{torch.version.hip}\" should be: \"6.3.42134-a9a80e791\"")
+            print("rocm version is known to be broken for YOLO training\ndownloading and/or running known good version now")
+            subprocess.run(["python3", "-m", "venv", ".venv-rocm63"])
+            pip_flags = ["--disable-pip-version-check", "--quiet", "--progress-bar", "on"]
+            subprocess.run([".venv-rocm63/bin/python3", "-m", "pip", "install", *pip_flags, "--upgrade", "pip"])
+            subprocess.run([".venv-rocm63/bin/python3", "-m", "pip", "install", *pip_flags, "-r", "src/requirements.txt"])
+            subprocess.run([".venv-rocm63/bin/python3", "-m", "pip", "install", *pip_flags, "-r", "src/requirements-rocm_headTrain.txt"])
+            subprocess.run([".venv-rocm63/bin/python3", "src/train_models.py", str(source.parent), "--kind", "head", "--processed-dataset", str(processed.parent), "--device", "rocm", "--epochs", str(epochs), "--head-batch-size", str(batch_size), "--head-image-size", str(image_size), "--isSubprocess", "True"])
+            return
     originals, generated = prepare_head_dataset(source, processed, settings)
     print(f"Prepared head data: copied={originals} augmented={generated}", flush=True)
     yaml_path = processed / "data.yaml"
@@ -152,16 +174,13 @@ def train_head_detector(source: Path, processed: Path, epochs: int, settings: Ge
     base_checkpoint.parent.mkdir(parents=True, exist_ok=True)
     model = YOLO(str(base_checkpoint))
     device = resolve_device(requested_device)
-    training_device = torch.device("cpu") if requested_device == "rocm" else device
-    if requested_device == "rocm":
-        print("ROCm YOLO training is disabled because the detector backend can segfault; using CPU for the head detector.", flush=True)
-    print(f"Starting YOLO head training on {training_device}...", flush=True)
+    print(f"Starting YOLO head training on {device}...", flush=True)
     model.train(
         data=str(yaml_path),
         epochs=min(15, max(1, epochs)),
         imgsz=image_size,
         batch=max(1, batch_size),
-        device=str(training_device),
+        device=str(device),
         workers=0,
         cache=False,
         amp=False,
@@ -253,6 +272,7 @@ def _main() -> None:
     parser.add_argument("--head-image-size", type=int, default=640, help="YOLO head-detector training image size.")
     parser.add_argument("--target-loss", type=float, help="Stop when the epoch average loss reaches this value.")
     parser.add_argument("--max-time", type=float, help="Stop after this many seconds.")
+    parser.add_argument("--isSubprocess", type=bool, default=False, help="Indicates if this is a subprocess. and prevents ROCM re-invocation. this should only be called automatically by the script itself, not by the user.")
     args = parser.parse_args()
     generate = load_generate_settings(args.settings)
     kinds = (args.kind,) if args.kind else ("presence", "color","head")
@@ -273,7 +293,7 @@ def _main() -> None:
     for kind in kinds:
         print(f"Training {kind} model...")
         if kind in ("head"):
-            train_head_detector(args.dataset / "heads", args.processed_dataset / "head", args.epochs, generate, args.device, args.head_batch_size, args.head_image_size)
+            train_head_detector(args.dataset / "heads", args.processed_dataset / "head", args.epochs, generate, args.device, args.head_batch_size, args.head_image_size, args.isSubprocess)
             continue
         labels = ("negative", "headset") if kind == "presence" else COLORS
         output = args.output / f"{kind}.pt" if args.output.is_dir() or not args.output.suffix else args.output
