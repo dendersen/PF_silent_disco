@@ -26,8 +26,11 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from generate_datapoints import augment_dataset
+from generate_datapoints import augment_dataset, augment_image
 from silent_disco import COLORS, SmallConvNet, resolve_device
+
+
+HEAD_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,67 @@ class CropDataset(Dataset[tuple[torch.Tensor, int]]):
         image = cv2.cvtColor(cv2.resize(image, (255, 255)), cv2.COLOR_BGR2RGB)
         array = (image.astype(np.float32) / 255.0 - 0.5) / 0.5
         return torch.from_numpy(array.transpose(2, 0, 1)), label
+
+
+def prepare_head_dataset(source: Path, destination: Path, settings: GenerateSettings) -> tuple[int, int]:
+    """Copy head images and augment pixels without changing YOLO boxes."""
+    if destination.exists():
+        shutil.rmtree(destination)
+    image_destination = destination / "images"
+    label_destination = destination / "labels"
+    image_destination.mkdir(parents=True)
+    label_destination.mkdir(parents=True)
+    rng = np.random.default_rng(settings.seed)
+    originals = 0
+    generated = 0
+    source_images = source / "images"
+    source_labels = source / "labels"
+    if not source_images.is_dir() or not source_labels.is_dir():
+        raise ValueError(f"Head dataset requires {source_images} and {source_labels}")
+    for image_path in sorted(source_images.iterdir()):
+        if image_path.suffix.lower() not in HEAD_IMAGE_EXTENSIONS:
+            continue
+        label_path = source_labels / f"{image_path.stem}.txt"
+        image = cv2.imread(str(image_path))
+        if image is None or not label_path.exists():
+            continue
+        shutil.copy2(image_path, image_destination / image_path.name)
+        shutil.copy2(label_path, label_destination / label_path.name)
+        originals += 1
+        if not settings.enabled:
+            continue
+        for iteration in range(settings.iterations):
+            augmented = augment_image(image, rng, settings.noise_strength, 0, settings.smoke_strength)
+            output_name = f"{image_path.stem}__aug{iteration:03d}{image_path.suffix.lower()}"
+            output_path = image_destination / output_name
+            if not cv2.imwrite(str(output_path), augmented):
+                raise ValueError(f"Could not write {output_path}")
+            shutil.copy2(label_path, label_destination / f"{Path(output_name).stem}.txt")
+            generated += 1
+    if originals == 0:
+        raise ValueError(f"No labeled head images found under {source}")
+    return originals, generated
+
+
+def train_head_detector(source: Path, processed: Path, epochs: int, settings: GenerateSettings) -> None:
+    """Train a one-class YOLO head detector on processed head data."""
+    originals, generated = prepare_head_dataset(source, processed, settings)
+    print(f"Prepared head data: copied={originals} augmented={generated}", flush=True)
+    yaml_path = processed / "data.yaml"
+    yaml_path.write_text(
+        f"path: {processed.resolve()}\n"
+        "train: images\n"
+        "val: images\n"
+        "names:\n"
+        "  0: head\n"
+    )
+    try:
+        from ultralytics import YOLO
+    except ImportError as error:
+        raise RuntimeError("Head training requires ultralytics; install src/requirements.txt") from error
+    model = YOLO("yolo11n.pt")
+    model.train(data=str(yaml_path), epochs=min(15, max(1, epochs)), imgsz=1280, device="cpu", project="models", name="head-detector", exist_ok=True)
+    print("saved models/head-detector/weights/best.pt", flush=True)
 
 
 def wait_for_enter(stop_event: threading.Event) -> None:
@@ -151,7 +215,7 @@ def train(root: Path, labels: tuple[str, ...], output: Path, epochs: int, batch_
 def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path)
-    parser.add_argument("--kind", choices=("presence", "color"), help="Train one model; omit to train both.")
+    parser.add_argument("--kind", choices=("head", "presence", "color"), help="Train one model; omit to train presence and color.")
     parser.add_argument("--output", type=Path, default=Path("models"), help="Model file for one kind, or output directory when training both.")
     parser.add_argument("--settings", type=Path, default=Path("generate.settings"), help="Augmentation settings file.")
     parser.add_argument("--processed-dataset", type=Path, default=Path("dataset_processed"), help="Temporary on-disk augmented dataset.")
@@ -165,6 +229,12 @@ def _main() -> None:
     kinds = (args.kind,) if args.kind else ("presence", "color")
     if len(kinds) > 1 and args.output.suffix:
         parser.error("--output must be a directory when --kind is omitted")
+    if kinds == ("head",):
+        train_head_detector(args.dataset / "heads", args.processed_dataset / "head", args.epochs, generate)
+        if generate.delete_dataset_after_training and args.processed_dataset.is_dir():
+            shutil.rmtree(args.processed_dataset, ignore_errors=True)
+        return
+
     print(f"Generating processed dataset at {args.processed_dataset}...", flush=True)
     for kind in kinds:
         source_labels = ("negative", "headset") if kind == "presence" else COLORS
@@ -183,7 +253,7 @@ def _main() -> None:
     if generate.delete_dataset_after_training and args.processed_dataset.is_dir():
         print("Deleting temporary dataset after training...")
         shutil.rmtree(args.processed_dataset, ignore_errors=True)
-        open(os.join(args.processed_dataset,".gitkeep"), 'a').close()  # recreate .gitkeep to avoid git issues
+        open(os.path.join(args.processed_dataset, ".gitkeep"), "a").close()
         print(f"deleted temporary dataset {args.processed_dataset}")
 
 

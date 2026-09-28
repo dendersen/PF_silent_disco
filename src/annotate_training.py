@@ -1,6 +1,6 @@
 """Launch the browser-based dataset studio."""
 
-from dataset_studio import main
+from studio_patch import main
 
 
 if __name__ == "__main__":
