@@ -31,10 +31,10 @@ The runtime stages are in `silent_disco.py`:
 
 1. `preprocess_image` upscales undersized frames until their shortest dimension is 3500 pixels, never downscales, and keeps colorful or bright pixels.
 2. Ultralytics YOLO detects people and returns bounding boxes, avoiding color/blob proposals that can miss people or select lights and walls.
-3. Each person box is converted into a padded square crop around the head and resized to 255x255 for the next stages.
+3. Each person box is expanded to a 1:1 square and resized to 255x255 for the next stages.
 4. The four-class `SmallConvNet` predicts green, blue, red, or unknown. Detector boxes are retained even when color is unknown so crops are not silently discarded.
 
-The default detector is `models/yolo11n.pt`; Ultralytics downloads it on first use. The default person confidence is `0.08`, which is useful for overhead event photos. Adjust it with `--person-confidence`. The older presence checkpoint is not used as a gate by default because it was trained on point-centered crops; enable `--verify-presence` only after retraining it with detector-generated head crops.
+The default detector is `models/yolo11n.pt`; Ultralytics downloads it on first use. The default person confidence is `0.08`, which is useful for overhead event photos. Adjust it with `--person-confidence`. The older presence checkpoint is not used as a gate by default because it was trained on point-centered crops; enable `--verify-presence` only after retraining it with detector-generated square crops.
 
 Train checkpoints with labeled crops:
 
@@ -85,34 +85,20 @@ The custom presence and color models run on ROCm. YOLO person detection defaults
 
 Each epoch displays a batch progress bar. The original `dataset` is never modified. The processed dataset remains on disk while all requested models train and is removed afterward when `delete_dataset_after_training` is enabled. Use `--processed-dataset` to choose another generated-data location.
 
-Create those crops with the browser annotator. Click a headset or other point
-in the image, then choose a button. `No headset` creates a negative presence
-crop and an unknown color crop. Multiple points can be labeled before moving to
-the next image:
+Create training data with the browser dataset studio. It has a head trainer for
+YOLO boxes and a color/presence trainer for one detector candidate at a time.
+Both trainers choose random video frames about 80% of the time, while retaining
+still images for coverage. `Skip` records no training example. The home page
+shows counts for every label, cumulative classifier accuracy, and CPU-only
+training controls capped at 15 epochs:
 
 The saved-crop gallery below the image lets you inspect every crop, change its
 label, or remove it from both training datasets.
 
-Use `Review auto points` to run the YOLO person detector on the current image.
-Each detected person's head crop is presented one at a time; choose its label
-and it advances automatically. After the final point, normal manual clicking
-resumes for the same image. The annotator uses the CPU detector by default to
-avoid the known YOLO ROCm crash.
-
-Auto-review points are separated by at least 60 pixels in the original image,
-and corner candidates are added when color blobs are sparse.
-
-```bash
-python3 src/annotate_training.py images --dataset dataset --detector-model models/yolo11n.pt --open
-```
-
-Auto-review uses overlapping 3000-pixel tiles and a 1280-pixel YOLO input by default, with a 0.03 person confidence threshold to recover small people. Adjust these with `--detector-tile-size` and `--detector-image-size` if needed.
-
-During auto-review, the annotator also shows the trained presence and color model predictions with confidence values. These are advisory; the label you choose remains the training ground truth. Use `--presence-model`, `--color-model`, and `--predictor-device` to select the checkpoints and prediction device.
-Presence predictions between 40% and 60% are shown as `uncertain` rather than being reported as a confident headset/no-headset decision. The color model only receives crops that pass the presence threshold, and no-headset/unknown crops are excluded from color training.
-The next-image action alternates between a randomly selected still image and a
-random frame from a randomly selected video. If port `8765` is already in use,
-choose another port, for example `--port 8766`.
+The head trainer writes YOLO data under `dataset/heads`. If port `8765` is
+already in use, choose another port with `--port 8766`. After training a head
+detector, restart the studio with its checkpoint using
+`--head-detector-model models/head-detector/weights/best.pt`.
 
 Training stops at the first of four conditions: press Enter, reach
 `--target-loss`, reach `--max-time` seconds, or reach `--epochs`. Use

@@ -143,7 +143,7 @@ def crop_255(image_bgr: np.ndarray, x: int, y: int, size: int = 255) -> np.ndarr
 
 
 def crop_person_head(image_bgr: np.ndarray, box: tuple[int, int, int, int], size: int = 255) -> tuple[np.ndarray, tuple[int, int]]:
-    """Make the exact 255x255 source crop used by the classifiers."""
+    """Expand a YOLO person box to a square and resize it for the classifiers."""
     crop_x1, crop_y1, crop_x2, crop_y2 = person_head_crop_box(box)
     crop_size = crop_x2 - crop_x1
     center_x = crop_x1 + crop_size // 2
@@ -153,14 +153,15 @@ def crop_person_head(image_bgr: np.ndarray, box: tuple[int, int, int, int], size
 
 
 def person_head_crop_box(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-    """Return the exact 255-pixel source square sent to the classifiers."""
+    """Return a square expanded from the YOLO person box."""
     x1, y1, x2, y2 = box
-    box_height = max(1, y2 - y1)
-    crop_size = 255
-    center_x = round((x1 + x2) / 2)
-    center_y = round(y1 + box_height * 0.18)
+    crop_size = max(1, x2 - x1, y2 - y1)
+    center_x = (x1 + x2) / 2
+    center_y = (y1 + y2) / 2
     half = crop_size // 2
-    return center_x - half, center_y - half, center_x - half + crop_size, center_y - half + crop_size
+    square_x1 = round(center_x - half)
+    square_y1 = round(center_y - half)
+    return square_x1, square_y1, square_x1 + crop_size, square_y1 + crop_size
 
 
 class SmallConvNet(nn.Module):

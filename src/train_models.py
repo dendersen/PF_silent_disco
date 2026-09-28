@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import os
 import shutil
 import subprocess
 import sys
@@ -182,6 +183,7 @@ def _main() -> None:
     if generate.delete_dataset_after_training and args.processed_dataset.is_dir():
         print("Deleting temporary dataset after training...")
         shutil.rmtree(args.processed_dataset, ignore_errors=True)
+        open(os.join(args.processed_dataset,".gitkeep"), 'a').close()  # recreate .gitkeep to avoid git issues
         print(f"deleted temporary dataset {args.processed_dataset}")
 
 
