@@ -1,6 +1,5 @@
 /.venv*
 /src/__pycache__
-
 /dataset
 /dataset_back
 /dataset_processed
@@ -14,3 +13,6 @@
 !/runs/detect/models/head-detector/weights/**
 
 !/**/*.gitkeep
+/weights
+src/__pycache__/*
+mount.txt

@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 import cv2
 import torch
 
-from silent_disco import COLOR_MODEL_CLASSES, crop_255, detect_people, load_model, load_person_detector, person_head_crop_box, predict_probabilities
+from silent_disco import COLOR_MODEL_CLASSES, crop_255, detect_people, load_model, load_person_detector, person_head_crop_box, predict_probabilities, crop_person_head
 
 LABELS = ("green", "blue", "red", "no-headset", "no-head")
 
@@ -32,7 +32,8 @@ async function labels(){let d=await api('/api/label/frame');app.innerHTML=`<h1>C
 
 def encode(image):
     ok, data = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    if not ok: raise ValueError('Could not encode image')
+    if not ok:
+        raise ValueError('Could not encode image')
     return base64.b64encode(data).decode('ascii')
 
 
@@ -41,41 +42,102 @@ class App:
         exts = {'.jpg', '.jpeg', '.png', '.bmp'}
         self.stills = sorted(p for p in image_dir.iterdir() if p.suffix.lower() in exts)
         self.videos = sorted(p for p in image_dir.iterdir() if p.suffix.lower() in {'.mp4', '.mov', '.avi', '.mkv'})
-        if not self.stills and not self.videos: raise ValueError(f'No media found in {image_dir}')
-        self.dataset = dataset; self.detector = load_person_detector(detector_path, torch.device('cpu'))
+        if not self.stills and not self.videos:
+            raise ValueError(f'No media found in {image_dir}')
+        self.dataset = dataset
+        self.detector = load_person_detector(detector_path, torch.device('cpu'))
         self.head_detector = load_person_detector(head_detector_path, torch.device('cpu')) if head_detector_path and head_detector_path.exists() else None
         self.presence_model = load_model(presence_path, 2, torch.device('cpu')) if presence_path else None
         self.color_model = load_model(color_path, len(COLOR_MODEL_CLASSES), torch.device('cpu')) if color_path else None
-        self.manifest = dataset / 'studio.json'; self.data = json.loads(self.manifest.read_text()) if self.manifest.exists() else {'heads': [], 'labels': []}
-        self.lock = threading.Lock(); self.job = None; self.job_kind = ''; self.job_log = []
-        self.head_path = None; self.head_image = None; self.label_items = []; self.label_index = 0
-        self.next_head(); self.next_label()
+        self.manifest = dataset / 'studio.json'
+        self.data = json.loads(self.manifest.read_text()) if self.manifest.exists() else {'heads': [], 'labels': []}
+        self.lock = threading.Lock()
+        self.job = None
+        self.job_kind = ''
+        self.job_log = []
+        self.head_path = None
+        self.head_image = None
+        self.label_items = []
+        self.label_index = 0
+        self.next_head()
+        self.next_label()
 
-    def write(self): self.dataset.mkdir(parents=True, exist_ok=True); self.manifest.write_text(json.dumps(self.data, indent=2))
+    def write(self): 
+        self.dataset.mkdir(parents=True, exist_ok=True)
+        self.manifest.write_text(json.dumps(self.data, indent=2))
     def counts(self):
-        c = {'head_boxes': len(self.data['heads']), 'green': 0, 'blue': 0, 'red': 0, 'no_headset': 0, 'no_head': 0, 'skipped': 0}
-        for x in self.data['labels']: c[x['label'].replace('-', '_')] = c.get(x['label'].replace('-', '_'), 0) + 1
+        c = {
+            'head_boxes': len(self.data['heads']),
+            'green': 0,
+            'blue': 0,
+            'red': 0,
+            'no_headset': 0,
+            'no_head': 0,
+            'skipped': 0
+            }
+        for x in self.data['labels']:
+            c[x['label'].replace('-', '_')] = c.get(x['label'].replace('-', '_'), 0) + 1
         return c
     def choose(self):
         if self.videos and (not self.stills or random.random() < .8):
-            p = random.choice(self.videos); cap = cv2.VideoCapture(str(p)); count = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT))); n = random.randrange(count); cap.set(cv2.CAP_PROP_POS_FRAMES, n); ok, image = cap.read(); cap.release()
-            if ok: return p, image, f'{p.name}#frame={n}'
-        p = random.choice(self.stills); return p, cv2.imread(str(p)), p.name
-    def next_head(self): self.head_path, self.head_image, self.head_source = self.choose()
+            p = random.choice(self.videos)
+            cap = cv2.VideoCapture(str(p))
+            count = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            n = random.randrange(count)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, n)
+            ok, image = cap.read()
+            cap.release()
+            if ok:
+                return p, image, f'{p.name}#frame={n}'
+        p = random.choice(self.stills)
+        return p, cv2.imread(str(p)), p.name
+    def next_head(self): 
+        self.head_path, self.head_image, self.head_source = self.choose()
     def next_label(self):
-        p, image, source = self.choose(); detector = self.head_detector or self.detector; people = detect_people(detector, image, confidence=.03, image_size=1280, tile_size=3000); self.label_items = [{'image': image, 'path': p, 'source': source, 'box': b, 'score': s} for b, s in people]; self.label_index = 0
+        p, image, source = self.choose()
+        detector = self.head_detector or self.detector
+        people = detect_people(detector, image, confidence=.1, image_size=1280, tile_size=3000)
+        for i, (box, score) in enumerate(people):
+            print(f"Detected person {i}, size {box[2]-box[0]}x{box[3]-box[1]}, score {score:.3f}")
+        self.label_items = [{'image': image, 'path': p, 'source': source, 'box': b, 'score': s} for b, s in people]
+        self.label_index = 0
     def crop(self, image, box):
-        x1,y1,x2,y2 = person_head_crop_box(box); size=x2-x1; return cv2.resize(crop_255(image,x1+size//2,y1+size//2,size),(255,255),interpolation=cv2.INTER_AREA)
-    def stats(self): return self.counts()
+        crop, point = crop_person_head(image, box)
+        return crop
+        if self.head_detector:
+            x1,y1,x2,y2=(round(value) for value in box)
+            center_x=round((x1+x2)/2)
+            center_y=round((y1+y2)/2)
+            size=max(1,round(max(x2-x1,y2-y1)*1.5))
+            return cv2.resize(crop_255(image,center_x,center_y,size),(255,255),interpolation=cv2.INTER_AREA)
+        x1,y1,x2,y2 = person_head_crop_box(box)
+        size=x2-x1
+        return cv2.resize(crop_255(image,x1+size//2,y1+size//2,size),(255,255),interpolation=cv2.INTER_AREA)
+    def stats(self): 
+        return self.counts()
     def head_frame(self):
-        h,w=self.head_image.shape[:2]; scale=min(1,1600/max(h,w)); image=cv2.resize(self.head_image,(round(w*scale),round(h*scale))) if scale<1 else self.head_image; return {'image':encode(image),'name':self.head_source,'stats':self.stats(),'note':'Videos are selected about 80% of the time.'}
+        h,w=self.head_image.shape[:2]
+        scale=min(1,1600/max(h,w))
+        image=cv2.resize(self.head_image,(round(w*scale),round(h*scale))) if scale<1 else self.head_image
+        return {
+            'image':encode(image),
+            'name':self.head_source,
+            'stats':self.stats(),
+            'note':'Videos are selected about 80% of the time.'
+            }
     def save_box(self, v):
         box=[float(v[k]) for k in ('x1','y1','x2','y2')]
         item={'id': max((int(entry.get('id', -1)) for entry in self.data['heads']), default=-1) + 1, 'image':self.head_source, 'box':box}
         self.data['heads'].append(item)
-        root=self.dataset/'heads'; (root/'images').mkdir(parents=True,exist_ok=True); (root/'labels').mkdir(parents=True,exist_ok=True)
-        stem=self.head_source.replace('#','_').replace('.','_'); cv2.imwrite(str(root/'images'/f'{stem}.jpg'),self.head_image)
-        with_file=root/'labels'/f'{stem}.txt'; x1,y1,x2,y2=box; line=f'0 {(x1+x2)/2:.6f} {(y1+y2)/2:.6f} {x2-x1:.6f} {y2-y1:.6f}\n'; with_file.write_text(with_file.read_text() + line if with_file.exists() else line)
+        root=self.dataset/'heads'
+        (root/'images').mkdir(parents=True,exist_ok=True)
+        (root/'labels').mkdir(parents=True,exist_ok=True)
+        stem=self.head_source.replace('#','_').replace('.','_')
+        cv2.imwrite(str(root/'images'/f'{stem}.jpg'),self.head_image)
+        with_file=root/'labels'/f'{stem}.txt'
+        x1,y1,x2,y2=box
+        line=f'0 {(x1+x2)/2:.6f} {(y1+y2)/2:.6f} {x2-x1:.6f} {y2-y1:.6f}\n'
+        with_file.write_text(with_file.read_text() + line if with_file.exists() else line)
         self.write()
         return item['id']
 
@@ -83,15 +145,21 @@ class App:
         index=next((index for index, entry in enumerate(self.data['heads']) if int(entry.get('id', -1)) == box_id), None)
         if index is None:
             return
-        entry=self.data['heads'].pop(index); source=str(entry['image']); stem=source.replace('#','_').replace('.','_'); root=self.dataset/'heads'; label_path=root/'labels'/f'{stem}.txt'
+        entry=self.data['heads'].pop(index)
+        source=str(entry['image'])
+        stem=source.replace('#','_').replace('.','_')
+        root=self.dataset/'heads'
+        label_path=root/'labels'/f'{stem}.txt'
         remaining=[item for item in self.data['heads'] if item['image'] == source]
         if remaining:
             lines=[]
             for item in remaining:
-                x1,y1,x2,y2=item['box']; lines.append(f'0 {(x1+x2)/2:.6f} {(y1+y2)/2:.6f} {x2-x1:.6f} {y2-y1:.6f}\n')
+                x1,y1,x2,y2=item['box']
+                lines.append(f'0 {(x1+x2)/2:.6f} {(y1+y2)/2:.6f} {x2-x1:.6f} {y2-y1:.6f}\n')
             label_path.write_text(''.join(lines))
         else:
-            label_path.unlink(missing_ok=True); (root/'images'/f'{stem}.jpg').unlink(missing_ok=True)
+            label_path.unlink(missing_ok=True)
+            (root/'images'/f'{stem}.jpg').unlink(missing_ok=True)
         self.write()
 
     def undo_last_box(self):
@@ -104,6 +172,10 @@ class App:
             self.undo_box(box_id)
 
     PAGE = PAGE.replace(';boxEvents()}', ';boxEventsImmediate()}')
+    PAGE = PAGE.replace(
+        '<img class="crop" src="data:image/jpeg;base64,${d.crop}">',
+        '<div class="stage"><img src="data:image/jpeg;base64,${d.image}"><div class="boxes"><i class="box" style="left:${d.box[0]}%;top:${d.box[1]}%;width:${d.box[2]}%;height:${d.box[3]}%"></i></div></div><img class="crop" src="data:image/jpeg;base64,${d.crop}">',
+    )
     PAGE = PAGE.replace(
         'async function labels()',
         r'''function boxEventsImmediate(){let stage=document.querySelector('#stage'),image=document.querySelector('#image'),boxes=document.querySelector('#boxes'),save=document.querySelector('#save'),first=null,current=null,saved=false;function point(e){let bounds=image.getBoundingClientRect(),scale=bounds.width/image.offsetWidth;return{x:Math.max(0,Math.min(image.offsetWidth,(e.clientX-bounds.left)/scale)),y:Math.max(0,Math.min(image.offsetHeight,(e.clientY-bounds.top)/scale))}}function redraw(end){let left=Math.min(first.x,end.x),top=Math.min(first.y,end.y);current.style.left=left+'px';current.style.top=top+'px';current.style.width=Math.abs(first.x-end.x)+'px';current.style.height=Math.abs(first.y-end.y)+'px'}async function cancel(){if(saved){await api('/api/head/undo',{method:'POST'});saved=false}if(current)current.remove();first=null;current=null;save.disabled=true;document.querySelector('#message').textContent='Box undone. Click the first corner of a head.'}image.draggable=false;stage.style.width='100%';image.style.width='100%';image.style.maxHeight='calc(100vh - 190px)';stage.addEventListener('dragstart',e=>e.preventDefault());document.addEventListener('keydown',e=>{if(e.key==='Escape')cancel()});image.addEventListener('mousemove',e=>{if(first)redraw(point(e))});image.addEventListener('click',async e=>{e.preventDefault();let clicked=point(e);if(!first){first=clicked;current=document.createElement('i');current.className='box';boxes.appendChild(current);current.style.left=clicked.x+'px';current.style.top=clicked.y+'px';document.querySelector('#message').textContent='First corner set. Move the mouse to preview, then click the opposite corner.';return}let end=clicked;redraw(end);let box={x1:Math.min(first.x,end.x)/image.offsetWidth,y1:Math.min(first.y,end.y)/image.offsetHeight,x2:Math.max(first.x,end.x)/image.offsetWidth,y2:Math.max(first.y,end.y)/image.offsetHeight};if(box.x2-box.x1<.01||box.y2-box.y1<.01){await cancel();return}first=null;save.disabled=true;await api('/api/head/box',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(box)});saved=true;current.className='box done';document.querySelector('#n').textContent++;document.querySelector('#message').textContent='Box accepted. Press Escape to undo it, or click the first corner of the next head.'});document.querySelector('#next').onclick=heads}
@@ -120,54 +192,134 @@ class App:
         color = int(torch.argmax(predict_probabilities(self.color_model, [crop], torch.device('cpu'))[0]).item())
         return COLOR_MODEL_CLASSES[color]
     def label_frame(self):
-        if not self.label_items: self.next_label()
-        if not self.label_items: raise ValueError('No detector candidates found')
-        x=self.label_items[self.label_index]; crop=self.crop(x['image'],x['box']); answers=[a for a in self.data['labels'] if a['label']!='skip']; correct=sum(a.get('correct',False) for a in answers); pred=self.prediction(crop); return {'crop':encode(crop),'source':x['source'],'index':self.label_index,'total':len(self.label_items),'prediction':pred,'accuracy':round(100*correct/max(1,len(answers))),'stats':self.stats(),'note':'Using head detector.' if self.head_detector else 'No head.pt found: using person boxes as temporary candidates.'}
+        if not self.label_items: 
+            self.next_label()
+        if not self.label_items: 
+            raise ValueError('No detector candidates found')
+        x=self.label_items[self.label_index]
+        crop=self.crop(x['image'],x['box'])
+        height,width=x['image'].shape[:2]
+        x1,y1,x2,y2=person_head_crop_box(x['box'])
+        box=(100*x1/width,100*y1/height,100*(x2-x1)/width,100*(y2-y1)/height)
+        answers=[a for a in self.data['labels'] if a['label']!='skip']
+        correct=sum(a.get('correct',False) for a in answers)
+        pred=self.prediction(crop)
+        return {
+            'image':encode(x['image']),
+            'box':box,
+            'crop':encode(crop),
+            'source':x['source'],
+            'index':self.label_index,
+            'total':len(self.label_items),
+            'prediction':pred,
+            'accuracy':round(100*correct/max(1,len(answers))),
+            'stats':self.stats(),
+            'note':'Using head detector.' if self.head_detector else 'No head detector checkpoint found: using person boxes as temporary candidates.'
+            }
     def answer(self, label):
-        x=self.label_items[self.label_index]; pred=self.prediction(self.crop(x['image'],x['box'])); self.data['labels'].append({'image':x['source'],'box':x['box'],'label':label,'prediction':pred,'correct':label==pred});
+        x=self.label_items[self.label_index]
+        pred=self.prediction(self.crop(x['image'],x['box']))
+        self.data['labels'].append({'image':x['source'],'box':x['box'],'label':label,'prediction':pred,'correct':label==pred});
         if label!='skip':
-            name=f'{len(self.data["labels"]):06d}.jpg'; crop=self.crop(x['image'],x['box']); presence='negative' if label in {'no-headset','no-head'} else 'headset'; color=label if label in {'green','blue','red'} else 'unknown';
-            for task, group in (('presence',presence),('color',color)): (self.dataset/task/group).mkdir(parents=True,exist_ok=True); cv2.imwrite(str(self.dataset/task/group/name),crop)
-        self.write(); self.label_index += 1
-        if self.label_index>=len(self.label_items): self.next_label()
-    def status(self): return {'running':bool(self.job and self.job.poll() is None),'kind':self.job_kind,'log':''.join(self.job_log)[-12000:],'status':'running' if self.job and self.job.poll() is None else ('finished' if self.job else 'idle')}
+            name=f'{len(self.data["labels"]):06d}.jpg'
+            crop=self.crop(x['image'],x['box'])
+            presence='negative' if label in {'no-headset','no-head'} else 'headset'
+            color=label if label in {'green','blue','red'} else 'unknown';
+            for task, group in (('presence',presence),('color',color)): (self.dataset/task/group).mkdir(parents=True,exist_ok=True)
+            cv2.imwrite(str(self.dataset/task/group/name),crop)
+        self.write()
+        self.label_index += 1
+        if self.label_index>=len(self.label_items):
+            self.next_label()
+    def status(self): 
+        return {
+            'running':bool(self.job and self.job.poll() is None),
+            'kind':self.job_kind,'log':''.join(self.job_log)[-12000:],
+            'status':'running' if self.job and self.job.poll() is None else ('finished' if self.job else 'idle')
+            }
     def train(self, kind):
         if self.job and self.job.poll() is None:return
-        cmd=[sys.executable,'src/train_models.py',str(self.dataset),'--kind','head','--device','cpu','--head-batch-size','1','--head-image-size','640','--epochs','15'] if kind=='head' else [sys.executable,'src/train_models.py',str(self.dataset),'--kind',kind,'--device','cpu','--epochs','15']; self.job_kind=kind; self.job_log=[]; self.job=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1); threading.Thread(target=self.read,daemon=True).start()
+        cmd=[
+            sys.executable,
+            'src/train_models.py',
+            str(self.dataset),
+            '--kind', 'head',
+            '--device', 'cpu',
+            '--head-batch-size', '1',
+            '--head-image-size', '640',
+            '--epochs','15'
+        ]if kind=='head' else [
+            sys.executable,
+            'src/train_models.py',
+            str(self.dataset),
+            '--kind', kind,
+            '--device', 'cpu',
+            '--epochs', '15'
+        ]
+        self.job_kind=kind
+        self.job_log=[]
+        self.job=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+        threading.Thread(target=self.read,daemon=True).start()
     def read(self):
         if self.job and self.job.stdout:
-            for line in self.job.stdout:self.job_log.append(line)
+            for line in self.job.stdout:
+                self.job_log.append(line)
     def stop(self):
-        if self.job and self.job.poll() is None:self.job.terminate();self.job_log.append('Stopped by user.\n')
+        if self.job and self.job.poll() is None:
+            self.job.terminate()
+            self.job_log.append('Stopped by user.\n')
 
 
 class Handler(BaseHTTPRequestHandler):
     app=None
-    def send(self,status,body,typ): self.send_response(status);self.send_header('Content-Type',typ);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+    def send(self,status,body,typ):
+        self.send_response(status)
+        self.send_header('Content-Type',typ)
+        self.send_header('Content-Length',str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
     def do_GET(self):
         route=urlparse(self.path).path
         try:
-            if route=='/api/stats': body=self.app.stats()
-            elif route=='/api/head/frame': self.app.next_head(); body=self.app.head_frame()
-            elif route=='/api/label/frame': body=self.app.label_frame()
-            elif route=='/api/train/status': body=self.app.status()
-            else:return self.send(200,PAGE.encode(),'text/html; charset=utf-8')
+            if route=='/api/stats':
+                body=self.app.stats()
+            elif route=='/api/head/frame':
+                self.app.next_head()
+                body=self.app.head_frame()
+            elif route=='/api/label/frame':
+                body=self.app.label_frame()
+            elif route=='/api/train/status':
+                body=self.app.status()
+            else:
+                return self.send(200,App.PAGE.encode(),'text/html;charset=utf-8')
             self.send(200,json.dumps(body).encode(),'application/json')
-        except Exception as e:self.send(500,str(e).encode(),'text/plain')
+        except Exception as e:
+            self.send(500,str(e).encode(),'text/plain')
     def do_POST(self):
-        n=int(self.headers.get('Content-Length','0')); payload=json.loads(self.rfile.read(n) or b'{}'); route=urlparse(self.path).path
+        n=int(self.headers.get('Content-Length','0'))
+        payload=json.loads(self.rfile.read(n) or b'{}')
+        route=urlparse(self.path).path
         try:
             with self.app.lock:
-                if route=='/api/head/box':self.app.save_box(payload)
-                elif route=='/api/head/undo':self.app.undo_last_box()
-                elif route=='/api/head/skip':self.app.skip_head()
-                elif route=='/api/label/answer':self.app.answer(payload['label'])
-                elif route=='/api/train':self.app.train(payload['kind'])
-                elif route=='/api/train/stop':self.app.stop()
-                else:return self.send(404,b'Not found','text/plain')
+                if route=='/api/head/box':
+                    self.app.save_box(payload)
+                elif route=='/api/head/undo':
+                    self.app.undo_last_box()
+                elif route=='/api/head/skip':
+                    self.app.skip_head()
+                elif route=='/api/label/answer':
+                    self.app.answer(payload['label'])
+                elif route=='/api/train':
+                    self.app.train(payload['kind'])
+                elif route=='/api/train/stop':
+                    self.app.stop()
+                else:
+                    return self.send(404,b'Not found','text/plain')
             self.send(204,b'','')
-        except Exception as e:self.send(500,str(e).encode(),'text/plain')
-    def log_message(self,*args):pass
+        except Exception as e:
+            self.send(500,str(e).encode(),'text/plain')
+    def log_message(self,*args):
+        pass
 
 
 def main():
@@ -175,20 +327,23 @@ def main():
     p.add_argument('image_dir',type=Path)
     p.add_argument('--dataset',type=Path,default=Path('dataset'))
     p.add_argument('--detector-model',type=Path,default=Path('models/yolo11n.pt'))
-    p.add_argument('--head-detector-model',type=Path,default=Path('models/head-detector/weights/best.pt'))
+    p.add_argument('--head-detector-model',type=Path,default=Path('runs/detect/models/head-detector/weights/best.pt'))
     p.add_argument('--presence-model',type=Path,default=Path('models/presence.pt'))
     p.add_argument('--color-model',type=Path,default=Path('models/color.pt'))
-    p.add_argument('--host',default='0.0.0.0',help='Interface to bind to; use 127.0.0.1 for local-only access.')
     p.add_argument('--port',type=int,default=8765)
     p.add_argument('--open',action='store_true')
     a=p.parse_args()
     Handler.app=App(a.image_dir,a.dataset,a.detector_model,a.head_detector_model,a.presence_model,a.color_model)
-    server=ThreadingHTTPServer((a.host,a.port),Handler)
-    url=f'http://{a.host}:{a.port}/'
+    server=ThreadingHTTPServer(('127.0.0.1',a.port),Handler)
+    url=f'http://127.0.0.1:{a.port}/'
     print(f'Open {url} to use the dataset studio.')
-    if a.open:webbrowser.open(url)
-    try:server.serve_forever()
-    except KeyboardInterrupt:pass
-    finally:server.server_close()
+    if a.open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 if __name__=='__main__':main()

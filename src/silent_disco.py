@@ -7,7 +7,10 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence, cast
+from torch.utils.data import Dataset
+from ultralytics import YOLO
+from ultralytics.engine.results import Results
 
 import cv2
 import numpy as np
@@ -19,6 +22,31 @@ COLORS = ("green", "blue", "red")
 COLOR_CLASSES = ("green", "blue", "red", "unknown")
 COLOR_MODEL_CLASSES = COLORS
 
+@dataclass(frozen=True)
+class GenerateSettings:
+    enabled: bool = True
+    iterations: int = 4
+    noise_strength: float = 0.15
+    max_shift: int = 10
+    smoke_strength: float = 0.15
+    seed: int = 20260926
+    delete_dataset_after_training: bool = True
+
+class CropDataset(Dataset[tuple[torch.Tensor, int]]):
+    def __init__(self, root: Path, labels: tuple[str, ...]) -> None:
+        self.items = [(path, index) for index, label in enumerate(labels) for path in sorted((root / label).glob("*"))]
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        path, label = self.items[index]
+        image = cv2.imread(str(path))
+        if image is None:
+            raise ValueError(f"Could not read {path}")
+        image = cv2.cvtColor(cv2.resize(image, (255, 255)), cv2.COLOR_BGR2RGB)
+        array = (image.astype(np.float32) / 255.0 - 0.5) / 0.5
+        return torch.from_numpy(array.transpose(2, 0, 1)), label# type: ignore
 
 @dataclass(frozen=True)
 class Candidate:
@@ -58,17 +86,25 @@ def rocm_available() -> bool:
 
 
 def resolve_device(requested: str = "auto") -> torch.device:
-    """Select CPU, NVIDIA CUDA, AMD ROCm, or Intel XPU at runtime."""
+    """Select CPU, NVIDIA CUDA, AMD ROCm, or Intel XPU at runtime.
+    requested: "auto" (default), "cpu", "cuda", "rocm", or "xpu"
+    """
+    requested = requested.lower()
     if requested == "cpu":
         return torch.device("cpu")
-    if requested == "rocm":
-        if rocm_available():
-            print(f"Using ROCm device", torch.cuda.get_device_name(torch.cuda.current_device()))
-            return torch.device("cuda")
-        raise RuntimeError("Requested device 'rocm' requires a ROCm-enabled PyTorch build and an available AMD GPU")
-    if requested in {"cuda", "auto"} and torch.cuda.is_available():
-        print(f"Using CUDA device", torch.cuda.get_device_name(torch.cuda.current_device()))
+    if requested in ("rocm", "auto") and rocm_available():
+        print(f"Using ROCm device", torch.cuda.get_device_name(torch.cuda.current_device()))
         return torch.device("cuda")
+    if requested in {"cuda", "auto"} and torch.cuda.is_available():
+        if rocm_available():
+            if requested == "cuda":
+                print(f"preventing cuda use as this is a rocm build")
+                print(f"there are important fixes for rocm in the codebase")
+                print(f"this is a known issue with ROCm builds of PyTorch")
+                print(f"please use --device rocm to run on a ROCm device")
+                print(f"if you are trying to run on a CUDA device, please use different build of PyTorch")
+        else:
+            return torch.device("cuda")
     if requested in {"xpu", "auto"} and hasattr(torch, "xpu") and torch.xpu.is_available():
         print("Using Intel XPU device", torch.xpu.get_device_name(torch.xpu.current_device()))
         return torch.device("xpu")
@@ -80,7 +116,7 @@ def resolve_device(requested: str = "auto") -> torch.device:
 
 def preprocess_image(image_bgr: np.ndarray, min_side: int = 3500) -> tuple[np.ndarray, np.ndarray]:
     """Suppress low-information pixels without downscaling the input."""
-    if image_bgr is None or image_bgr.ndim != 3:
+    if image_bgr is None or image_bgr.ndim != 3:# type: ignore
         raise ValueError("image_bgr must be a color image")
     height, width = image_bgr.shape[:2]
     scale = max(1.0, min_side / min(height, width))
@@ -126,7 +162,7 @@ def find_candidate_points(cleaned_bgr: np.ndarray, mask: np.ndarray, max_candida
     if not selected or augment_corners:
         gray = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2GRAY)
         corners = cv2.goodFeaturesToTrack(gray, maxCorners=max_candidates, qualityLevel=0.005, minDistance=min_distance, mask=mask)
-        if corners is not None:
+        if corners is not None:# type: ignore
             for corner in corners.reshape(-1, 2):
                 point_x, point_y = round(float(corner[0])), round(float(corner[1]))
                 if all((point_x - item.x) ** 2 + (point_y - item.y) ** 2 >= min_distance**2 for item in selected):
@@ -141,14 +177,15 @@ def crop_255(image_bgr: np.ndarray, x: int, y: int, size: int = 255) -> np.ndarr
     padded = cv2.copyMakeBorder(image_bgr, half, half, half, half, cv2.BORDER_REFLECT_101)
     return padded[y:y + size, x:x + size]
 
-
 def crop_person_head(image_bgr: np.ndarray, box: tuple[int, int, int, int], size: int = 255) -> tuple[np.ndarray, tuple[int, int]]:
     """Expand a YOLO person box to a square and resize it for the classifiers."""
-    crop_x1, crop_y1, crop_x2, crop_y2 = person_head_crop_box(box)
-    crop_size = crop_x2 - crop_x1
-    center_x = crop_x1 + crop_size // 2
-    center_y = crop_y1 + crop_size // 2
-    crop = crop_255(image_bgr, center_x, center_y, crop_size)
+    x1, y1, x2, y2 = box
+    center_x = (x1 + x2) // 2
+    center_y = (y1 + y2) // 2
+    crop_size = max(1, x2 - x1, y2 - y1)
+    half = crop_size // 2
+    crop = cv2.copyMakeBorder(image_bgr, half, half, half, half, cv2.BORDER_REFLECT_101)
+    crop = crop[center_y:center_y + size, center_x:center_x + size]
     return cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA), (center_x, center_y)
 
 
@@ -194,10 +231,6 @@ def load_model(path: Path | None, classes: int, device: torch.device) -> SmallCo
 
 def load_person_detector(path: Path, device: torch.device | None = None):
     """Load a pretrained detector and configure it to return people only."""
-    try:
-        from ultralytics import YOLO
-    except ImportError as error:
-        raise RuntimeError("Person detection requires ultralytics; install src/requirements.txt") from error
     detector = YOLO(str(path))
     if device is not None:
         detector.to(str(device))
@@ -205,7 +238,7 @@ def load_person_detector(path: Path, device: torch.device | None = None):
 
 
 def detect_people(
-    detector,
+    detector:YOLO,
     image_bgr: np.ndarray,
     confidence: float = 0.08,
     image_size: int = 1280,
@@ -215,6 +248,7 @@ def detect_people(
     """Return person boxes using overlapping tiles so small people are not lost."""
     height, width = image_bgr.shape[:2]
     tile_size = max(0, tile_size)
+    tiles: list[tuple[int, int, np.ndarray]] = []
     if not tile_size or (width <= tile_size and height <= tile_size):
         tiles = [(0, 0, image_bgr)]
     else:
@@ -233,14 +267,16 @@ def detect_people(
     boxes: list[list[int]] = []
     scores: list[float] = []
     for left, top, tile in tiles:
-        result = detector.predict(tile, classes=[0], conf=confidence, imgsz=image_size, max_det=300, verbose=False)[0]
-        for coordinates, score in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy()):
+        result:Results|torch.Tensor = detector.predict(tile, classes=[0], conf=confidence, imgsz=image_size, max_det=300, verbose=False)[0] # type: ignore
+        if not isinstance(result, torch.Tensor) and not isinstance(result, Results):
+            raise RuntimeError("Unexpected YOLO result type; please update ultralytics to a recent version")
+        for coordinates, score in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy()):# type: ignore
             x1, y1, x2, y2 = (round(float(value)) for value in coordinates)
-            box = [max(0, x1 + left), max(0, y1 + top), min(width - 1, x2 + left), min(height - 1, y2 + top)]
+            box:list[int] = [max(0, x1 + left), max(0, y1 + top), min(width - 1, x2 + left), min(height - 1, y2 + top)]
             if box[2] > box[0] and box[3] > box[1]:
                 boxes.append([box[0], box[1], box[2] - box[0], box[3] - box[1]])
                 scores.append(float(score))
-    selected = cv2.dnn.NMSBoxes(boxes, scores, confidence, 0.45) if boxes else []
+    selected:Sequence[int]  = cv2.dnn.NMSBoxes(boxes, scores, confidence, 0.45) if boxes else []
     return [((boxes[index][0], boxes[index][1], boxes[index][0] + boxes[index][2], boxes[index][1] + boxes[index][3]), scores[index]) for index in (int(item) for item in selected)]
 
 
@@ -252,35 +288,28 @@ def tensors_from_bgr(crops: list[np.ndarray], device: torch.device) -> torch.Ten
     if not crops:
         return torch.empty((0, 3, 255, 255), device=device)
     arrays = [((cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 - 0.5) / 0.5).transpose(2, 0, 1) for crop in crops]
-    return torch.from_numpy(np.stack(arrays)).to(device)
+    return torch.from_numpy(np.stack(arrays)).to(device)# type: ignore
 
 
 def predict_probabilities(model: SmallConvNet, crops: list[np.ndarray], device: torch.device, batch_size: int = 32) -> torch.Tensor:
-    outputs = []
+    outputs:list[torch.Tensor] = []
     with torch.inference_mode():
         for start in range(0, len(crops), batch_size):
             batch = tensors_from_bgr(crops[start:start + batch_size], device)
             outputs.append(torch.softmax(model(batch), dim=1).cpu())
-    return torch.cat(outputs) if outputs else torch.empty((0, model.classifier[-1].out_features))
+    if outputs:
+        return torch.cat(outputs) 
+    else:
+        output_layer = cast(nn.Linear, model.classifier[-1])
+        return torch.empty((0, output_layer.out_features))
 
-
-def heuristic_color(crop: np.ndarray) -> tuple[str, float]:
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    scores = {
-        "green": float(np.mean((hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 85) & (hsv[:, :, 1] > 80))),
-        "blue": float(np.mean((hsv[:, :, 0] >= 90) & (hsv[:, :, 0] <= 135) & (hsv[:, :, 1] > 80))),
-        "red": float(np.mean(((hsv[:, :, 0] <= 10) | (hsv[:, :, 0] >= 170)) & (hsv[:, :, 1] > 80))),
-    }
-    color = max(scores, key=scores.get)
-    return (color, min(1.0, scores[color] * 8.0)) if scores[color] >= 0.01 else ("unknown", 0.0)
-
-
-def analyze_frame(image_bgr: np.ndarray, detector, presence_model: SmallConvNet | None, color_model: SmallConvNet | None, device: torch.device, presence_threshold: float = 0.5, person_confidence: float = 0.08, verify_presence: bool = True, detector_image_size: int = 1280, detector_tile_size: int = 3000, detector_tile_overlap: float = 0.2) -> tuple[list[Detection], dict[str, float], np.ndarray]:
+def analyze_frame(image_bgr: np.ndarray, detector:YOLO, presence_model: SmallConvNet | None, color_model: SmallConvNet | None, device: torch.device, presence_threshold: float = 0.5, person_confidence: float = 0.08, verify_presence: bool = True, detector_image_size: int = 1280, detector_tile_size: int = 3000, detector_tile_overlap: float = 0.2) -> tuple[list[Detection], dict[str, float], np.ndarray]:
     people = detect_people(detector, image_bgr, person_confidence, detector_image_size, detector_tile_size, detector_tile_overlap)
-    crops = []
-    points = []
-    boxes = []
-    detector_scores = []
+    crops:list[np.ndarray] = []
+    points:list[tuple[int, int]] = []
+    boxes:list[tuple[int, int, int, int]] = []
+    presence_scores:list[float] = []
+    detector_scores:list[float] = []
     for box, detector_score in people:
         crop, point = crop_person_head(image_bgr, box)
         boxes.append(box)
@@ -290,10 +319,10 @@ def analyze_frame(image_bgr: np.ndarray, detector, presence_model: SmallConvNet 
     if presence_model is None or not verify_presence:
         presence_scores = detector_scores
     else:
-        presence_scores = predict_probabilities(presence_model, crops, device)[:, 1].tolist()
+        presence_scores = predict_probabilities(presence_model, crops, device)[:, 1].tolist() # type: ignore 
     accepted = [(point, box, crop, presence) for point, box, crop, presence in zip(points, boxes, crops, presence_scores) if not verify_presence or presence >= presence_threshold]
     if color_model is None:
-        color_predictions = [heuristic_color(crop) for _, _, crop, _ in accepted]
+        raise RuntimeError("Color model is required for color prediction")
     elif accepted and presence_model is not None and verify_presence:
         probabilities = predict_probabilities(color_model, [crop for _, _, crop, _ in accepted], device)
         color_predictions = [(COLOR_MODEL_CLASSES[int(torch.argmax(probability).item())], float(torch.max(probability).item())) for probability in probabilities]
@@ -316,10 +345,10 @@ def analyze_frame(image_bgr: np.ndarray, detector, presence_model: SmallConvNet 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 3)
         head_x1, head_y1, head_x2, head_y2 = person_head_crop_box(box)
         overlay = annotated.copy()
-        cv2.rectangle(overlay, (head_x1, head_y1), (head_x2, head_y2), color, -1)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
         annotated = cv2.addWeighted(overlay, 0.22, annotated, 0.78, 0)
-        cv2.rectangle(annotated, (head_x1, head_y1), (head_x2, head_y2), color, 3)
-        cv2.putText(annotated, label, (head_x1, max(24, head_y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+        cv2.putText(annotated, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
     return detections, ratios, annotated
 
 
@@ -366,7 +395,7 @@ def main() -> None:
         started = time.perf_counter()
         detections, ratios, annotated = analyze_frame(frame, detector, presence_model, color_model, device, presence_threshold=args.presence_threshold, person_confidence=args.person_confidence, verify_presence=not args.skip_presence)
         counts = {color: sum(d.color == color for d in detections) for color in COLORS}
-        payload = {"frame": frame_number, "detections": len(detections), "ratios": ratios, "smoothed_ratios": smoother.update(counts), "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
+        payload:dict[str, int|float|dict[str, int|float]] = {"frame": frame_number, "detections": len(detections), "ratios": ratios, "smoothed_ratios": smoother.update(counts), "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
         print(json.dumps(payload), flush=True)
         if args.display:
             cv2.imshow("silent disco", annotated)
