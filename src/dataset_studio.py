@@ -171,7 +171,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('image_dir',type=Path);p.add_argument('--dataset',type=Path,default=Path('dataset'));p.add_argument('--detector-model',type=Path,default=Path('models/yolo11n.pt'));p.add_argument('--head-detector-model',type=Path,default=Path('models/head-detector/weights/best.pt'));p.add_argument('--presence-model',type=Path,default=Path('models/presence.pt'));p.add_argument('--color-model',type=Path,default=Path('models/color.pt'));p.add_argument('--port',type=int,default=8765);p.add_argument('--open',action='store_true');a=p.parse_args();Handler.app=App(a.image_dir,a.dataset,a.detector_model,a.head_detector_model,a.presence_model,a.color_model);server=ThreadingHTTPServer(('127.0.0.1',a.port),Handler);url=f'http://127.0.0.1:{a.port}/';print(f'Open {url} to use the dataset studio.');
+    p=argparse.ArgumentParser()
+    p.add_argument('image_dir',type=Path)
+    p.add_argument('--dataset',type=Path,default=Path('dataset'))
+    p.add_argument('--detector-model',type=Path,default=Path('models/yolo11n.pt'))
+    p.add_argument('--head-detector-model',type=Path,default=Path('models/head-detector/weights/best.pt'))
+    p.add_argument('--presence-model',type=Path,default=Path('models/presence.pt'))
+    p.add_argument('--color-model',type=Path,default=Path('models/color.pt'))
+    p.add_argument('--host',default='0.0.0.0',help='Interface to bind to; use 127.0.0.1 for local-only access.')
+    p.add_argument('--port',type=int,default=8765)
+    p.add_argument('--open',action='store_true')
+    a=p.parse_args()
+    Handler.app=App(a.image_dir,a.dataset,a.detector_model,a.head_detector_model,a.presence_model,a.color_model)
+    server=ThreadingHTTPServer((a.host,a.port),Handler)
+    url=f'http://{a.host}:{a.port}/'
+    print(f'Open {url} to use the dataset studio.')
     if a.open:webbrowser.open(url)
     try:server.serve_forever()
     except KeyboardInterrupt:pass

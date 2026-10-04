@@ -1,0 +1,15 @@
+[yolo]
+model = models/yolo11n.pt
+imgsz = 640
+batch = 1
+device = auto
+amp = false
+workers = 0
+epochs = 12
+
+[benchmark]
+device = all
+models = yolo, conv
+conv_imgsz = 255
+warmup = 5
+iterations = 20

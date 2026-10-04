@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from generate_datapoints import augment_dataset, augment_image
 from silent_disco import COLORS, SmallConvNet, resolve_device
+from training_settings import load_training_settings
 
 
 HEAD_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
@@ -142,7 +143,7 @@ def head_rocm_known_broken() -> bool:
     known_broken_versions.append("7.0.51831")
     return any(version.startswith(broken) for broken in known_broken_versions)
 
-def train_head_detector(source: Path, processed: Path, epochs: int, settings: GenerateSettings, requested_device: str, batch_size: int, image_size: int, is_subprocess: bool) -> None:
+def train_head_detector(source: Path, processed: Path, epochs: int, settings: GenerateSettings, requested_device: str, batch_size: int, image_size: int, model_path: Path, amp: bool, workers: int, is_subprocess: bool, reuse_processed: bool) -> None:
     """Train a one-class YOLO head detector on processed head data."""
     if requested_device == "rocm":
         if head_rocm_known_broken():
@@ -156,8 +157,11 @@ def train_head_detector(source: Path, processed: Path, epochs: int, settings: Ge
             subprocess.run([".venv-rocm63/bin/python3", "-m", "pip", "install", *pip_flags, "-r", "src/requirements-rocm_headTrain.txt"])
             subprocess.run([".venv-rocm63/bin/python3", "src/train_models.py", str(source.parent), "--kind", "head", "--processed-dataset", str(processed.parent), "--device", "rocm", "--epochs", str(epochs), "--head-batch-size", str(batch_size), "--head-image-size", str(image_size), "--isSubprocess", "True"])
             return
-    originals, generated = prepare_head_dataset(source, processed, settings)
-    print(f"Prepared head data: copied={originals} augmented={generated}", flush=True)
+    if reuse_processed and (processed / "images").is_dir() and any((processed / "images").iterdir()):
+        print(f"head: reusing existing processed data at {processed}", flush=True)
+    else:
+        originals, generated = prepare_head_dataset(source, processed, settings)
+        print(f"Prepared head data: copied={originals} augmented={generated}", flush=True)
     yaml_path = processed / "data.yaml"
     yaml_path.write_text(
         f"path: {processed.resolve()}\n"
@@ -168,22 +172,30 @@ def train_head_detector(source: Path, processed: Path, epochs: int, settings: Ge
     )
     try:
         from ultralytics import YOLO
+        from ultralytics.utils import nms as ultralytics_nms
     except ImportError as error:
         raise RuntimeError("Head training requires ultralytics; install src/requirements.txt") from error
-    base_checkpoint = Path("models/yolo11n.pt")
+    original_nms = ultralytics_nms.non_max_suppression
+
+    def unlimited_nms(*args, **kwargs):
+        kwargs["max_time_img"] = float("inf")
+        return original_nms(*args, **kwargs)
+
+    ultralytics_nms.non_max_suppression = unlimited_nms
+    base_checkpoint = model_path
     base_checkpoint.parent.mkdir(parents=True, exist_ok=True)
     model = YOLO(str(base_checkpoint))
     device = resolve_device(requested_device)
     print(f"Starting YOLO head training on {device}...", flush=True)
     model.train(
         data=str(yaml_path),
-        epochs=min(15, max(1, epochs)),
+        epochs=max(1, epochs),
         imgsz=image_size,
         batch=max(1, batch_size),
         device=str(device),
-        workers=0,
+        workers=workers,
         cache=False,
-        amp=False,
+        amp=amp,
         project="models",
         name="head-detector",
         exist_ok=True,
@@ -264,17 +276,25 @@ def _main() -> None:
     parser.add_argument("--kind", choices=("head", "presence", "color"), help="Train one model; omit to train all models.")
     parser.add_argument("--output", type=Path, default=Path("models"), help="Model file for one kind, or output directory when training both.")
     parser.add_argument("--settings", type=Path, default=Path("generate.settings"), help="Augmentation settings file.")
+    parser.add_argument("--training-settings", type=Path, default=Path("training.settings"), help="Shared YOLO training and benchmark settings file.")
     parser.add_argument("--processed-dataset", type=Path, default=Path("dataset_processed"), help="Temporary on-disk augmented dataset.")
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "rocm", "xpu"), default="auto")
-    parser.add_argument("--epochs", type=int, default=12, help="Maximum epochs; 0 means no epoch limit.")
+    parser.add_argument("--reuse-processed-dataset", action="store_true", help="Reuse an existing generated head dataset instead of rebuilding it.")
+    parser.add_argument("--keep-processed-dataset", action="store_true", help="Keep generated data after training.")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "rocm", "xpu"), default=None)
+    parser.add_argument("--epochs", type=int, default=None, help="Maximum epochs; 0 means no epoch limit.")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--head-batch-size", type=int, default=1, help="YOLO head-detector batch size; keep small on ROCm.")
-    parser.add_argument("--head-image-size", type=int, default=640, help="YOLO head-detector training image size.")
+    parser.add_argument("--head-batch-size", type=int, default=None, help="YOLO head-detector batch size; keep small on ROCm.")
+    parser.add_argument("--head-image-size", type=int, default=None, help="YOLO head-detector training image size.")
     parser.add_argument("--target-loss", type=float, help="Stop when the epoch average loss reaches this value.")
     parser.add_argument("--max-time", type=float, help="Stop after this many seconds.")
     parser.add_argument("--isSubprocess", type=bool, default=False, help="Indicates if this is a subprocess. and prevents ROCM re-invocation. this should only be called automatically by the script itself, not by the user.")
     args = parser.parse_args()
     generate = load_generate_settings(args.settings)
+    training = load_training_settings(args.training_settings)
+    epochs = training.epochs if args.epochs is None else args.epochs
+    device = training.device if args.device is None else args.device
+    batch_size = training.batch_size if args.head_batch_size is None else args.head_batch_size
+    image_size = training.image_size if args.head_image_size is None else args.head_image_size
     kinds = (args.kind,) if args.kind else ("presence", "color","head")
     if len(kinds) > 1 and args.output.suffix:
         parser.error("--output must be a directory when --kind is omitted")
@@ -293,13 +313,13 @@ def _main() -> None:
     for kind in kinds:
         print(f"Training {kind} model...")
         if kind in ("head"):
-            train_head_detector(args.dataset / "heads", args.processed_dataset / "head", args.epochs, generate, args.device, args.head_batch_size, args.head_image_size, args.isSubprocess)
+            train_head_detector(args.dataset / "heads", args.processed_dataset / "head", epochs, generate, device, batch_size, image_size, training.model, training.amp, training.workers, args.isSubprocess, args.reuse_processed_dataset)
             continue
         labels = ("negative", "headset") if kind == "presence" else COLORS
         output = args.output / f"{kind}.pt" if args.output.is_dir() or not args.output.suffix else args.output
-        train(args.processed_dataset / kind, labels, output, args.epochs, args.batch_size, args.target_loss, args.max_time, args.device)
+        train(args.processed_dataset / kind, labels, output, epochs, args.batch_size, args.target_loss, args.max_time, device)
         print(f"Finished training {kind} model.")
-    if generate.delete_dataset_after_training and args.processed_dataset.is_dir():
+    if generate.delete_dataset_after_training and not args.keep_processed_dataset and args.processed_dataset.is_dir():
         print("Deleting temporary dataset after training...")
         shutil.rmtree(args.processed_dataset, ignore_errors=True)
         args.processed_dataset.mkdir(parents=True, exist_ok=True)

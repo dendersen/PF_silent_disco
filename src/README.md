@@ -73,6 +73,39 @@ For ROCm training, use the ROCm PyTorch environment explicitly:
 python3 src/train_models.py dataset --device rocm --epochs 25
 ```
 
+YOLO training and the YOLO training-step benchmark share `training.settings`:
+
+```ini
+[yolo]
+model = models/yolo11n.pt
+imgsz = 640
+batch = 1
+device = auto
+amp = false
+workers = 0
+epochs = 12
+
+[benchmark]
+device = all
+models = yolo, conv
+conv_imgsz = 255
+warmup = 5
+iterations = 20
+```
+
+Run the benchmark with the same settings used by training:
+
+```bash
+python3 src/benchmark_training.py
+```
+
+This benchmarks both YOLO and `SmallConvNet` on every selected device. Use
+`--model yolo` or `--model conv` to benchmark only one model family.
+
+Override the file for a one-off comparison, for example `--device xpu` or
+`--batch-size 2`. Training accepts `--training-settings PATH` when using a
+different configuration file.
+
 After training, generate the color-percentage CSV and plot for every video in a directory:
 
 ```bash
@@ -84,6 +117,13 @@ Add `--display-ai-frame` to open a live annotated frame window. Each detected hu
 The custom presence and color models run on ROCm. YOLO person detection defaults to CPU because its ROCm path can segfault on some PyTorch/Ultralytics combinations; use `--detector-device rocm` only when that stack is known to be stable. Unknown/no-color detections are excluded from the percentage denominator. The live window has a video selector on the right; choosing a video shows only that video's curves while processing continues.
 
 Each epoch displays a batch progress bar. The original `dataset` is never modified. The processed dataset remains on disk while all requested models train and is removed afterward when `delete_dataset_after_training` is enabled. Use `--processed-dataset` to choose another generated-data location.
+
+Existing processed presence and color data is reused automatically. To reuse an existing generated head dataset as well, keep it and pass:
+
+```bash
+python3 src/train_models.py dataset --kind head \
+  --reuse-processed-dataset --keep-processed-dataset
+```
 
 Create training data with the browser dataset studio. It has a head trainer for
 YOLO boxes and a color/presence trainer for one detector candidate at a time.
